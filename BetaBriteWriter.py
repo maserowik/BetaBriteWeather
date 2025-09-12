@@ -160,7 +160,7 @@ def choose_on_off_times(current_on, current_off):
         print("❌ Invalid time format. Please use HH:MM in 24-hour format.")
 
 # -----------------------------
-# Menu
+# Menu (original base code)
 # -----------------------------
 def review_settings(settings):
     start_display = settings.get("DISPLAY_ON_START", False)
@@ -291,13 +291,11 @@ SCHEDULED_HOURS = [0,3,6,9,12,15,18,21]
 
 def get_next_forecast_times(now=None):
     if now is None: now = datetime.now()
-    # Always include current time on reboot
-    forecast_times = []
-    forecast_times.append(now)
-    count = 1
+    # Include current time immediately on reboot
+    forecast_times = [now]
     candidate = now
-    while len(forecast_times) < 3:
-        next_hour = min([h for h in SCHEDULED_HOURS if h > candidate.hour], default=None)
+    while len(forecast_times)<3:
+        next_hour = min([h for h in SCHEDULED_HOURS if h>candidate.hour], default=None)
         if next_hour is None:
             candidate = candidate.replace(hour=SCHEDULED_HOURS[0], minute=0, second=0, microsecond=0) + timedelta(days=1)
         else:
@@ -364,19 +362,15 @@ def check_alerts(ser, zone, settings):
                 alert_texts.append(f"NHC: {latest_entry.title} || {latest_entry.summary}")
     except Exception:
         traceback.print_exc()
-        log("Error fetching NHC alerts", settings)
+        log("Error fetching NHC feed", settings)
 
-    # Send alerts if any
     if alert_texts:
-        full_alert_text = FS + alert_color + " || ".join(alert_texts)
-        clear_slot(ser)
-        send_message(ser, full_alert_text)
-        log(f"Alerts sent: {full_alert_text}", settings)
-        return True
-    return False
+        colored_alerts = FS+alert_color+" || ".join(alert_texts)
+        send_message(ser,colored_alerts)
+        log(f"Alerts sent: {colored_alerts}", settings)
 
 # -----------------------------
-# Forecast send
+# Forecast sender (full rule-compliant)
 # -----------------------------
 def send_forecast(ser, settings, now=None):
     if now is None:
@@ -384,7 +378,6 @@ def send_forecast(ser, settings, now=None):
     api_type = settings.get("API_TYPE","OpenWeather")
     api_key = settings.get("API_KEY","")
     zip_code = settings.get("ZIP_CODE","")
-
     forecast_times = get_next_forecast_times(now)
 
     try:
@@ -404,13 +397,13 @@ def send_forecast(ser, settings, now=None):
                     daily_forecast[dt.date()].append(entry.get("values",{}))
 
         today_blocks = []
-        for f_time in forecast_times:
+        for i, f_time in enumerate(forecast_times):
             entries = daily_forecast.get(f_time.date(), [])
-            if not entries:
-                continue
-            entry = min(entries, key=lambda x: abs(
-                (datetime.fromtimestamp(x["dt"]) if api_type=="OpenWeather" else datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00"))) - f_time
-            ))
+            if not entries: continue
+            if api_type=="OpenWeather":
+                entry = min(entries, key=lambda x: abs(datetime.fromtimestamp(x["dt"]) - f_time))
+            else:
+                entry = min(entries, key=lambda x: abs(datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00")) - f_time))
             today_blocks.append(build_forecast_string(entry, f_time, api_type))
 
         # Future summary
@@ -433,8 +426,12 @@ def send_forecast(ser, settings, now=None):
             future_blocks.append(f"{day.strftime('%a %m/%d/%y')} {most_common} {min(temps_min)}F/{max(temps_max)}F")
 
         colored_text = build_colored_blocks(today_blocks,"today")+build_colored_blocks(future_blocks,"future")
-        next_update = forecast_times[-1]
-        colored_text += f" || Next update: {next_update.strftime('%m/%d/%y %I:%M %p').lstrip('0')}"
+
+        # Correct next update
+        next_update_candidates = [t for t in forecast_times[1:]]
+        if next_update_candidates:
+            next_update = next_update_candidates[0]
+            colored_text += f" || Next update: {next_update.strftime('%m/%d/%y %I:%M %p').lstrip('0')}"
 
         clear_slot(ser)
         send_message(ser,colored_text)
@@ -446,49 +443,43 @@ def send_forecast(ser, settings, now=None):
         log("Error sending forecast", settings)
 
 # -----------------------------
-# ON/OFF
+# Exit cleanup
 # -----------------------------
-def is_on_time(settings, now=None):
-    if now is None: now = datetime.now()
-    on_h,on_m = map(int, settings.get("ON_TIME","06:00").split(":"))
-    off_h,off_m = map(int, settings.get("OFF_TIME","22:00").split(":"))
-    on_dt = now.replace(hour=on_h, minute=on_m, second=0, microsecond=0)
-    off_dt = now.replace(hour=off_h, minute=off_m, second=0, microsecond=0)
-    if off_dt <= on_dt: return now>=on_dt or now<=off_dt
-    return on_dt<=now<=off_dt
-
-def show_date_time(ser):
-    now = datetime.now()
-    dt_text = now.strftime("%m/%d/%y %I:%M %p")
-    full_text = f"Check Program || {dt_text}"
-    clear_slot(ser)
-    colored_text = FS + "1" + full_text
-    send_message(ser, colored_text)
-
+def show_exit_message(ser):
+    dt = datetime.now().strftime("%m/%d/%y %I:%M %p").lstrip("0")
+    send_message(ser,f"Check Program || {dt}")
 
 # -----------------------------
-# Main
+# Main Loop
 # -----------------------------
 def main():
     rotate_logs()
     settings = load_settings()
     settings, start_display = review_settings(settings)
+    save_settings(settings)
+
     ser = init_serial(settings["COM_PORT"])
+    atexit.register(show_exit_message, ser)
 
     try:
         while True:
             now = datetime.now()
-            if is_on_time(settings, now):
-                alerts_active = check_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
-                if not alerts_active:
-                    send_forecast(ser, settings, now)
+            check_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
+            send_forecast(ser, settings, now)
+            # Wait until next hour mark in SCHEDULED_HOURS
+            next_times = [h for h in SCHEDULED_HOURS if h>now.hour]
+            if next_times:
+                next_time = now.replace(hour=next_times[0],minute=0,second=0,microsecond=0)
             else:
-                print("Display off; skipping data pull.")
-            time.sleep(60)
-    except KeyboardInterrupt:
-        show_date_time(ser)
-        ser.close()
-        print("\nProgram stopped.")
+                next_time = now.replace(hour=SCHEDULED_HOURS[0],minute=0,second=0,microsecond=0)+timedelta(days=1)
+            sleep_seconds = (next_time - datetime.now()).total_seconds()
+            if sleep_seconds<0:
+                sleep_seconds=60
+            time.sleep(sleep_seconds)
 
-if __name__=="__main__":
+    except KeyboardInterrupt:
+        show_exit_message(ser)
+        print("\nProgram exited by user.")
+
+if __name__ == "__main__":
     main()
