@@ -134,11 +134,9 @@ def choose_com_port(current=""):
 
         port_input = input(f"Enter COM port or number [current {current}]: ").strip()
 
-        # Keep current if blank
         if not port_input and current:
             return current
 
-        # Allow selection by number
         if port_input.isdigit():
             idx = int(port_input) - 1
             if 0 <= idx < len(available_ports):
@@ -147,7 +145,6 @@ def choose_com_port(current=""):
                 print("❌ Invalid number. Try again.")
                 continue
 
-        # Allow direct match (case-insensitive)
         for port in available_ports:
             if port.lower() == port_input.lower():
                 return port
@@ -216,7 +213,6 @@ def review_settings(settings):
             settings["ON_TIME"] = on_time
             settings["OFF_TIME"] = off_time
         elif choice == "5":
-            # Strict Weather API selection loop
             while True:
                 api_type = input("Select Weather API (1-OpenWeather, 2-Tomorrow.io): ").strip()
                 if api_type == "1":
@@ -228,7 +224,6 @@ def review_settings(settings):
                 else:
                     print("❌ Invalid choice. Enter 1 for OpenWeather or 2 for Tomorrow.io.")
         elif choice == "6":
-            # Strict API key validation loop
             current = settings.get("API_KEY","")
             while True:
                 key = input(f"Enter API Key [current {current}]: ").strip() or current
@@ -294,13 +289,21 @@ def clear_slot(ser):
 # -----------------------------
 SCHEDULED_HOURS = [0,3,6,9,12,15,18,21]
 
-def get_next_forecast_time(now=None):
+def get_next_forecast_times(now=None):
     if now is None: now = datetime.now()
-    for h in SCHEDULED_HOURS:
-        candidate = now.replace(hour=h, minute=0, second=0, microsecond=0)
-        if candidate > now:
-            return candidate
-    return now.replace(hour=SCHEDULED_HOURS[0], minute=0, second=0, microsecond=0)+timedelta(days=1)
+    # Always include current time on reboot
+    forecast_times = []
+    forecast_times.append(now)
+    count = 1
+    candidate = now
+    while len(forecast_times) < 3:
+        next_hour = min([h for h in SCHEDULED_HOURS if h > candidate.hour], default=None)
+        if next_hour is None:
+            candidate = candidate.replace(hour=SCHEDULED_HOURS[0], minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            candidate = candidate.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+        forecast_times.append(candidate)
+    return forecast_times
 
 # -----------------------------
 # Forecast string builder
@@ -351,7 +354,7 @@ def check_alerts(ser, zone, settings):
 
     # NHC Atlantic
     try:
-        feed_url = "https://www.nhc.noaa.gov/atom/nhc_public_at.xml"
+        feed_url = "https://www.nhc.noaa.gov/text/refresh/MIATCPAT1+shtml/"
         feed = feedparser.parse(feed_url)
         if feed.entries:
             latest_entry = feed.entries[0]
@@ -375,11 +378,15 @@ def check_alerts(ser, zone, settings):
 # -----------------------------
 # Forecast send
 # -----------------------------
-def send_forecast(ser, settings):
-    now = datetime.now()
+def send_forecast(ser, settings, now=None):
+    if now is None:
+        now = datetime.now()
     api_type = settings.get("API_TYPE","OpenWeather")
     api_key = settings.get("API_KEY","")
     zip_code = settings.get("ZIP_CODE","")
+
+    forecast_times = get_next_forecast_times(now)
+
     try:
         daily_forecast = defaultdict(list)
         if api_type=="OpenWeather":
@@ -396,25 +403,17 @@ def send_forecast(ser, settings):
                     dt = datetime.fromisoformat(entry.get("startTime"))
                     daily_forecast[dt.date()].append(entry.get("values",{}))
 
-        # Next 3-hour slots
         today_blocks = []
-        slots_collected = 0
-        for offset in range(0,48):
-            candidate_time = now + timedelta(hours=offset)
-            if candidate_time.hour not in SCHEDULED_HOURS:
+        for f_time in forecast_times:
+            entries = daily_forecast.get(f_time.date(), [])
+            if not entries:
                 continue
-            entry_list = daily_forecast.get(candidate_time.date(),[])
-            if not entry_list:
-                continue
-            entry = min(entry_list, key=lambda x: abs(
-                (datetime.fromtimestamp(x["dt"]) if api_type=="OpenWeather" else datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00"))) - candidate_time
+            entry = min(entries, key=lambda x: abs(
+                (datetime.fromtimestamp(x["dt"]) if api_type=="OpenWeather" else datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00"))) - f_time
             ))
-            today_blocks.append(build_forecast_string(entry, candidate_time, api_type))
-            slots_collected += 1
-            if slots_collected >= 3:
-                break
+            today_blocks.append(build_forecast_string(entry, f_time, api_type))
 
-        # Future daily summary
+        # Future summary
         future_blocks = []
         future_days = sorted(daily_forecast.keys())
         future_days = [d for d in future_days if d>now.date()][:5]
@@ -434,7 +433,7 @@ def send_forecast(ser, settings):
             future_blocks.append(f"{day.strftime('%a %m/%d/%y')} {most_common} {min(temps_min)}F/{max(temps_max)}F")
 
         colored_text = build_colored_blocks(today_blocks,"today")+build_colored_blocks(future_blocks,"future")
-        next_update = get_next_forecast_time(now)
+        next_update = forecast_times[-1]
         colored_text += f" || Next update: {next_update.strftime('%m/%d/%y %I:%M %p').lstrip('0')}"
 
         clear_slot(ser)
@@ -466,6 +465,7 @@ def show_date_time(ser):
     colored_text = FS + "1" + full_text
     send_message(ser, colored_text)
 
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -473,23 +473,22 @@ def main():
     rotate_logs()
     settings = load_settings()
     settings, start_display = review_settings(settings)
-    PORT = settings["COM_PORT"]
-    ser = init_serial(PORT)
+    ser = init_serial(settings["COM_PORT"])
 
-    if start_display:
-        try:
-            while True:
-                now = datetime.now()
-                if is_on_time(settings, now):
-                    if not check_alerts(ser, settings.get("FORECAST_ZONE",""), settings):
-                        send_forecast(ser, settings)
-                else:
-                    show_date_time(ser)
-                time.sleep(60)
-        except KeyboardInterrupt:
-            print("Stopping program...")
-            show_date_time(ser)
-            sys.exit(0)
+    try:
+        while True:
+            now = datetime.now()
+            if is_on_time(settings, now):
+                alerts_active = check_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
+                if not alerts_active:
+                    send_forecast(ser, settings, now)
+            else:
+                print("Display off; skipping data pull.")
+            time.sleep(60)
+    except KeyboardInterrupt:
+        show_date_time(ser)
+        ser.close()
+        print("\nProgram stopped.")
 
 if __name__=="__main__":
     main()
