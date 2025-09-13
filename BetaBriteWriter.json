@@ -6,5 +6,5 @@
     "FORECAST_ZONE": "PAZ021",
     "ON_TIME": "06:00",
     "OFF_TIME": "22:00",
-    "LOGGING_ON": false
+    "LOGGING_ON": true
 }

@@ -160,10 +160,9 @@ def choose_on_off_times(current_on, current_off):
         print("❌ Invalid time format. Please use HH:MM in 24-hour format.")
 
 # -----------------------------
-# Menu (original base code)
+# Menu
 # -----------------------------
 def review_settings(settings):
-    start_display = settings.get("DISPLAY_ON_START", False)
     valid_choices = {"1","2","3","4","5","6","7","S","L","0"}
 
     while True:
@@ -241,7 +240,6 @@ def review_settings(settings):
             else:
                 print("❌ Failed zone validation. Keeping previous value.")
         elif choice == "S":
-            start_display = True
             break
         elif choice == "L":
             settings["LOGGING_ON"] = not settings.get("LOGGING_ON", False)
@@ -251,7 +249,7 @@ def review_settings(settings):
 
         save_settings(settings)
 
-    return settings, start_display
+    return settings
 
 # -----------------------------
 # BetaBrite init
@@ -291,7 +289,6 @@ SCHEDULED_HOURS = [0,3,6,9,12,15,18,21]
 
 def get_next_forecast_times(now=None):
     if now is None: now = datetime.now()
-    # Include current time immediately on reboot
     forecast_times = [now]
     candidate = now
     while len(forecast_times)<3:
@@ -370,7 +367,7 @@ def check_alerts(ser, zone, settings):
         log(f"Alerts sent: {colored_alerts}", settings)
 
 # -----------------------------
-# Forecast sender (full rule-compliant)
+# Forecast sender with 5-min retry
 # -----------------------------
 def send_forecast(ser, settings, now=None):
     if now is None:
@@ -406,7 +403,6 @@ def send_forecast(ser, settings, now=None):
                 entry = min(entries, key=lambda x: abs(datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00")) - f_time))
             today_blocks.append(build_forecast_string(entry, f_time, api_type))
 
-        # Future summary
         future_blocks = []
         future_days = sorted(daily_forecast.keys())
         future_days = [d for d in future_days if d>now.date()][:5]
@@ -426,16 +422,27 @@ def send_forecast(ser, settings, now=None):
             future_blocks.append(f"{day.strftime('%a %m/%d/%y')} {most_common} {min(temps_min)}F/{max(temps_max)}F")
 
         colored_text = build_colored_blocks(today_blocks,"today")+build_colored_blocks(future_blocks,"future")
-
-        # Correct next update
         next_update_candidates = [t for t in forecast_times[1:]]
         if next_update_candidates:
             next_update = next_update_candidates[0]
             colored_text += f" || Next update: {next_update.strftime('%m/%d/%y %I:%M %p').lstrip('0')}"
 
-        clear_slot(ser)
-        send_message(ser,colored_text)
-        log(f"Forecast sent: {colored_text}", settings)
+        # --- Retry logic ---
+        start_time = time.time()
+        max_retry_seconds = 300  # 5 minutes
+        while True:
+            try:
+                clear_slot(ser)
+                send_message(ser, colored_text)
+                log(f"Forecast sent: {colored_text}", settings)
+                break
+            except Exception as e:
+                elapsed = time.time() - start_time
+                print(f"❌ COM/USB send failed: {e}. Retrying...")
+                if elapsed > max_retry_seconds:
+                    print("❌ Failed to send forecast after 5 minutes. Waiting until next scheduled update.")
+                    break
+                time.sleep(10)
 
     except Exception:
         print("Error sending forecast:")
@@ -455,7 +462,7 @@ def show_exit_message(ser):
 def main():
     rotate_logs()
     settings = load_settings()
-    settings, start_display = review_settings(settings)
+    settings = review_settings(settings)
     save_settings(settings)
 
     ser = init_serial(settings["COM_PORT"])
@@ -466,12 +473,14 @@ def main():
             now = datetime.now()
             check_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
             send_forecast(ser, settings, now)
+
             # Wait until next hour mark in SCHEDULED_HOURS
             next_times = [h for h in SCHEDULED_HOURS if h>now.hour]
             if next_times:
                 next_time = now.replace(hour=next_times[0],minute=0,second=0,microsecond=0)
             else:
                 next_time = now.replace(hour=SCHEDULED_HOURS[0],minute=0,second=0,microsecond=0)+timedelta(days=1)
+
             sleep_seconds = (next_time - datetime.now()).total_seconds()
             if sleep_seconds<0:
                 sleep_seconds=60
