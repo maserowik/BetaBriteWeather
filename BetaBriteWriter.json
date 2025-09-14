@@ -1,7 +1,7 @@
 {
     "COM_PORT": "COM3",
     "API_TYPE": "OpenWeather",
-    "API_KEY": "5925ac67b6c84c8e79b88c6fcd7295ab",
+    "API_KEY": "",
     "ZIP_CODE": "15102",
     "FORECAST_ZONE": "PAZ021",
     "ON_TIME": "06:00",
