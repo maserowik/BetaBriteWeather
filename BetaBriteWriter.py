@@ -290,7 +290,7 @@ SCHEDULED_HOURS = [0,3,6,9,12,15,18,21]
 
 def get_next_forecast_times(now=None):
     if now is None: now = datetime.now()
-    forecast_times = [now]  # include immediate poll exactly at current time
+    forecast_times = [now]
     candidate = now
     while len(forecast_times)<3:
         next_hour = min([h for h in SCHEDULED_HOURS if h>candidate.hour], default=None)
@@ -309,7 +309,7 @@ def build_forecast_string(entry, dt, api_type):
         desc = entry["weather"][0]["main"]
         t_min = int(entry["main"]["temp_min"])
         t_max = int(entry["main"]["temp_max"])
-    else:  # Tomorrow.io
+    else:
         desc = entry.get("weatherCode","N/A")
         t = entry.get("temperature",0)
         t_min = t_max = int(t)
@@ -324,17 +324,37 @@ def build_colored_blocks(blocks, mode="future"):
     return result
 
 # -----------------------------
-# NWS Alerts
+# NWS Alerts (updated polling & logging)
 # -----------------------------
 last_alert_id = None
+last_nws_pull = None
+NWS_NORMAL_INTERVAL = 300  # 5 minutes
+NWS_ACTIVE_INTERVAL = 120  # 2 minutes
+
 def check_nws_alerts(ser, zone, settings):
-    global last_alert_id
+    global last_alert_id, last_nws_pull
+    now = time.time()
+    if last_nws_pull is None:
+        last_nws_pull = 0
+
+    # Determine interval
+    interval = NWS_NORMAL_INTERVAL
+    if last_alert_id is not None:
+        interval = NWS_ACTIVE_INTERVAL
+
+    if now - last_nws_pull < interval:
+        return  # Skip this pull
+
+    last_nws_pull = now
     alert_texts = []
 
     try:
         url = f"https://api.weather.gov/alerts/active?zone={zone}"
-        data = requests.get(url, timeout=5).json()
-        alerts = data.get("features",[])
+        response = requests.get(url, timeout=5)
+        log(f"NWS pull response status: {response.status_code}", settings)
+        data = response.json()
+        log(f"NWS pull response data: {json.dumps(data)}", settings)
+        alerts = data.get("features", [])
         if alerts:
             latest = alerts[0]["id"]
             if latest != last_alert_id:
@@ -343,9 +363,9 @@ def check_nws_alerts(ser, zone, settings):
                 desc = alerts[0]["properties"]["description"]
                 alert_texts.append(f"NWS: {headline} || {desc}")
                 log(f"NWS alert active: {headline} || {desc}", settings)
-    except Exception:
+    except Exception as e:
+        log(f"Error fetching NWS alerts: {e}", settings)
         traceback.print_exc()
-        log("Error fetching NWS alerts", settings)
 
 # -----------------------------
 # Forecast sender with retry (+1 minute bug fixed)
@@ -381,7 +401,6 @@ def send_forecast(ser, settings, now=None):
             entries = daily_forecast.get(f_time.date(), [])
             if not entries: continue
             if api_type=="OpenWeather":
-                # --- FIX: take the closest forecast without rounding minutes (+1 bug fix) ---
                 entry = min(entries, key=lambda x: abs(datetime.fromtimestamp(x["dt"]) - f_time))
             else:
                 entry = min(entries, key=lambda x: abs(datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00")) - f_time))
@@ -411,9 +430,8 @@ def send_forecast(ser, settings, now=None):
             next_update = next_update_candidates[0]
             colored_text += f" || Next update: {next_update.strftime('%m/%d/%y %I:%M %p').lstrip('0')}"
 
-        # --- Retry logic ---
         start_time = time.time()
-        max_retry_seconds = 300  # 5 minutes
+        max_retry_seconds = 300
         while True:
             try:
                 send_message(ser, colored_text)
@@ -452,18 +470,14 @@ def main():
     atexit.register(show_exit_message, ser)
 
     try:
-        # Immediately show forecast at startup
         now = datetime.now()
         check_nws_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
         send_forecast(ser, settings, now)
 
         while True:
             now = datetime.now()
-            # NWS alerts check every 5 minutes or 2 minutes if active
             check_nws_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
-
-            # Forecast updates at scheduled hours
-            if now.minute==0 and now.hour in SCHEDULED_HOURS:
+            if now.minute == 0 and now.hour in SCHEDULED_HOURS:
                 send_forecast(ser, settings, now)
             time.sleep(60)
     except KeyboardInterrupt:
