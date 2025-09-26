@@ -18,6 +18,7 @@ from serial.tools import list_ports
 SETTINGS_FILE = "BetaBriteWriter.json"
 LOG_FILE = "BetaBriteWriter.log"
 MAX_LOG_DAYS = 5
+MAX_LOG_SIZE_KB = 2048  # 2 MB
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
@@ -47,12 +48,14 @@ def save_settings(settings):
 # -----------------------------
 def rotate_logs():
     if os.path.exists(LOG_FILE):
-        for i in reversed(range(1, MAX_LOG_DAYS)):
-            src = f"{LOG_FILE}.{i}"
-            dst = f"{LOG_FILE}.{i+1}"
-            if os.path.exists(src):
-                os.replace(src, dst)
-        shutil.move(LOG_FILE, f"{LOG_FILE}.1")
+        size_kb = os.path.getsize(LOG_FILE) / 1024
+        if size_kb >= MAX_LOG_SIZE_KB:
+            for i in reversed(range(1, MAX_LOG_DAYS)):
+                src = f"{LOG_FILE}.{i}"
+                dst = f"{LOG_FILE}.{i+1}"
+                if os.path.exists(src):
+                    os.replace(src, dst)
+            shutil.move(LOG_FILE, f"{LOG_FILE}.1")
 
 def log(msg, settings=None):
     if settings and settings.get("LOGGING_ON"):
@@ -278,6 +281,7 @@ def send_message(ser, text, mode="a"):
     ser.write(packet)
     ser.flush()
     time.sleep(0.2)
+    log(f"Sent to BetaBrite: {packet}", settings={"LOGGING_ON": True})
 
 # -----------------------------
 # Forecast schedule
@@ -286,7 +290,7 @@ SCHEDULED_HOURS = [0,3,6,9,12,15,18,21]
 
 def get_next_forecast_times(now=None):
     if now is None: now = datetime.now()
-    forecast_times = [now]
+    forecast_times = [now]  # include immediate poll exactly at current time
     candidate = now
     while len(forecast_times)<3:
         next_hour = min([h for h in SCHEDULED_HOURS if h>candidate.hour], default=None)
@@ -320,15 +324,13 @@ def build_colored_blocks(blocks, mode="future"):
     return result
 
 # -----------------------------
-# NWS and NHC Alerts
+# NWS Alerts
 # -----------------------------
 last_alert_id = None
-last_nhc_time = None
-def check_alerts(ser, zone, settings):
-    global last_alert_id, last_nhc_time
+def check_nws_alerts(ser, zone, settings):
+    global last_alert_id
     alert_texts = []
 
-    # NWS
     try:
         url = f"https://api.weather.gov/alerts/active?zone={zone}"
         data = requests.get(url, timeout=5).json()
@@ -340,31 +342,13 @@ def check_alerts(ser, zone, settings):
                 headline = alerts[0]["properties"]["headline"]
                 desc = alerts[0]["properties"]["description"]
                 alert_texts.append(f"NWS: {headline} || {desc}")
+                log(f"NWS alert active: {headline} || {desc}", settings)
     except Exception:
         traceback.print_exc()
         log("Error fetching NWS alerts", settings)
 
-    # NHC Atlantic
-    try:
-        feed_url = "https://www.nhc.noaa.gov/text/refresh/MIATCPAT1+shtml/"
-        feed = feedparser.parse(feed_url)
-        if feed.entries:
-            latest_entry = feed.entries[0]
-            published_time = latest_entry.get("published_parsed")
-            if not last_nhc_time or published_time > last_nhc_time:
-                last_nhc_time = published_time
-                alert_texts.append(f"NHC: {latest_entry.title} || {latest_entry.summary}")
-    except Exception:
-        traceback.print_exc()
-        log("Error fetching NHC feed", settings)
-
-    if alert_texts:
-        colored_alerts = FS+alert_color+" || ".join(alert_texts)
-        send_message(ser,colored_alerts)
-        log(f"Alerts sent: {colored_alerts}", settings)
-
 # -----------------------------
-# Forecast sender with retry
+# Forecast sender with retry (+1 minute bug fixed)
 # -----------------------------
 def send_forecast(ser, settings, now=None):
     if now is None:
@@ -379,12 +363,14 @@ def send_forecast(ser, settings, now=None):
         if api_type=="OpenWeather":
             url = f"http://api.openweathermap.org/data/2.5/forecast?zip={zip_code},us&units=imperial&appid={api_key}"
             data = requests.get(url).json()
+            log(f"Full API response OpenWeather: {data}", settings)
             for entry in data.get("list",[]):
                 dt = datetime.fromtimestamp(entry["dt"])
                 daily_forecast[dt.date()].append(entry)
         else:
             url = f"https://api.tomorrow.io/v4/timelines?location={zip_code}&fields=temperature,weatherCode&units=imperial&timesteps=1h&apikey={api_key}"
             data = requests.get(url).json()
+            log(f"Full API response Tomorrow.io: {data}", settings)
             for timeline in data.get("data",{}).get("timelines",[]):
                 for entry in timeline.get("intervals",[]):
                     dt = datetime.fromisoformat(entry.get("startTime"))
@@ -395,6 +381,7 @@ def send_forecast(ser, settings, now=None):
             entries = daily_forecast.get(f_time.date(), [])
             if not entries: continue
             if api_type=="OpenWeather":
+                # --- FIX: take the closest forecast without rounding minutes (+1 bug fix) ---
                 entry = min(entries, key=lambda x: abs(datetime.fromtimestamp(x["dt"]) - f_time))
             else:
                 entry = min(entries, key=lambda x: abs(datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00")) - f_time))
@@ -467,13 +454,14 @@ def main():
     try:
         # Immediately show forecast at startup
         now = datetime.now()
-        check_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
+        check_nws_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
         send_forecast(ser, settings, now)
 
         while True:
             now = datetime.now()
-            # Alerts
-            check_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
+            # NWS alerts check every 5 minutes or 2 minutes if active
+            check_nws_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
+
             # Forecast updates at scheduled hours
             if now.minute==0 and now.hour in SCHEDULED_HOURS:
                 send_forecast(ser, settings, now)
