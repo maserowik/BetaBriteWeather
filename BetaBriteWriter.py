@@ -1,7 +1,9 @@
+# base_code.py
+
 import serial
 import time
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
 import json
 import atexit
@@ -9,8 +11,8 @@ from collections import defaultdict, Counter
 import traceback
 import sys
 import shutil
-import feedparser  # for NHC advisories
 from serial.tools import list_ports
+import threading  # For NHC polling
 
 # -----------------------------
 # Settings file handling (JSON)
@@ -71,27 +73,18 @@ def validate_api_key(api_key):
     url = f"http://api.openweathermap.org/data/2.5/weather?zip={test_zip},US&appid={api_key}"
     try:
         response = requests.get(url, timeout=5)
-        if response.status_code == 401:
-            print("❌ Invalid API key.")
-            return False
-        return True
-    except Exception as e:
-        print(f"❌ API validation error: {e}")
+        return response.status_code != 401
+    except Exception:
         return False
 
 def validate_zip(zip_code, api_key):
     if not (zip_code.isdigit() and len(zip_code) == 5):
-        print("❌ Invalid ZIP format. Must be 5 digits.")
         return False
     url = f"http://api.openweathermap.org/data/2.5/weather?zip={zip_code},US&appid={api_key}"
     try:
         response = requests.get(url, timeout=5)
-        if response.status_code != 200:
-            print(f"❌ ZIP not recognized: {response.json().get('message', 'Unknown error')}")
-            return False
-        return True
-    except Exception as e:
-        print(f"❌ ZIP validation error: {e}")
+        return response.status_code == 200
+    except Exception:
         return False
 
 def validate_forecast_zone(zone):
@@ -99,12 +92,8 @@ def validate_forecast_zone(zone):
     url = f"https://api.weather.gov/zones/forecast/{zone}"
     try:
         response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            return True
-        print(f"❌ Forecast zone not valid: {zone}")
-        return False
-    except Exception as e:
-        print(f"❌ Error validating forecast zone: {e}")
+        return response.status_code == 200
+    except Exception:
         return False
 
 def validate_time_format(timestr):
@@ -119,14 +108,7 @@ def validate_time_format(timestr):
 # -----------------------------
 def list_available_com_ports():
     ports = list_ports.comports()
-    available = [p.device for p in ports]
-    if not available:
-        print("❌ No serial ports found on this system.")
-    else:
-        print("Available COM/serial ports:")
-        for i, port in enumerate(available, 1):
-            print(f"{i}. {port}")
-    return available
+    return [p.device for p in ports]
 
 def choose_com_port(current=""):
     while True:
@@ -134,25 +116,17 @@ def choose_com_port(current=""):
         if not available_ports:
             input("No ports detected. Connect a device and press Enter to retry...")
             continue
-
         port_input = input(f"Enter COM port or number [current {current}]: ").strip()
-
         if not port_input and current:
             return current
-
         if port_input.isdigit():
             idx = int(port_input) - 1
             if 0 <= idx < len(available_ports):
                 return available_ports[idx]
-            else:
-                print("❌ Invalid number. Try again.")
-                continue
-
+            continue
         for port in available_ports:
             if port.lower() == port_input.lower():
                 return port
-
-        print("❌ Invalid port. Please choose from the list or enter a valid number.")
 
 def choose_on_off_times(current_on, current_off):
     while True:
@@ -160,14 +134,12 @@ def choose_on_off_times(current_on, current_off):
         off_time = input(f"Enter OFF_TIME (HH:MM 24h) [current {current_off}]: ").strip() or current_off
         if validate_time_format(on_time) and validate_time_format(off_time):
             return on_time, off_time
-        print("❌ Invalid time format. Please use HH:MM in 24-hour format.")
 
 # -----------------------------
 # Menu
 # -----------------------------
 def review_settings(settings):
     valid_choices = {"1","2","3","4","5","6","7","S","L","0"}
-
     while True:
         print("\n==================================================")
         print("       BETABRITE WEATHER DISPLAY SYSTEM")
@@ -197,17 +169,11 @@ def review_settings(settings):
             settings["COM_PORT"] = choose_com_port(current)
         elif choice == "3":
             current = settings.get("ZIP_CODE","")
-            for _ in range(3):
-                key = settings.get("API_KEY","")
-                if not key:
-                    print("❌ Enter API key first!")
-                    break
+            key = settings.get("API_KEY","")
+            if key:
                 val = input(f"Enter ZIP Code [current {current}]: ").strip() or current
                 if validate_zip(val, key):
                     settings["ZIP_CODE"] = val
-                    break
-            else:
-                print("❌ Failed ZIP validation. Keeping previous value.")
         elif choice == "4":
             current_on = settings.get("ON_TIME","06:00")
             current_off = settings.get("OFF_TIME","22:00")
@@ -223,25 +189,16 @@ def review_settings(settings):
                 elif api_type == "2":
                     settings["API_TYPE"] = "Tomorrow.io"
                     break
-                else:
-                    print("❌ Invalid choice. Enter 1 for OpenWeather or 2 for Tomorrow.io.")
         elif choice == "6":
             current = settings.get("API_KEY","")
-            while True:
-                key = input(f"Enter API Key [current {current}]: ").strip() or current
-                if validate_api_key(key):
-                    settings["API_KEY"] = key
-                    break
-                print("❌ Invalid API key. Please enter a valid key.")
+            key = input(f"Enter API Key [current {current}]: ").strip() or current
+            if validate_api_key(key):
+                settings["API_KEY"] = key
         elif choice == "7":
             current = settings.get("FORECAST_ZONE","")
-            for _ in range(3):
-                val = input(f"Enter Forecast Zone [current {current}]: ").strip() or current
-                if validate_forecast_zone(val):
-                    settings["FORECAST_ZONE"] = val
-                    break
-            else:
-                print("❌ Failed zone validation. Keeping previous value.")
+            val = input(f"Enter Forecast Zone [current {current}]: ").strip() or current
+            if validate_forecast_zone(val):
+                settings["FORECAST_ZONE"] = val
         elif choice == "S":
             break
         elif choice == "L":
@@ -301,9 +258,6 @@ def get_next_forecast_times(now=None):
         forecast_times.append(candidate)
     return forecast_times
 
-# -----------------------------
-# Forecast string builder
-# -----------------------------
 def build_forecast_string(entry, dt, api_type):
     if api_type=="OpenWeather":
         desc = entry["weather"][0]["main"]
@@ -324,36 +278,34 @@ def build_colored_blocks(blocks, mode="future"):
     return result
 
 # -----------------------------
-# NWS Alerts (updated polling & logging)
+# NWS Alerts
 # -----------------------------
 last_alert_id = None
 last_nws_pull = None
-NWS_NORMAL_INTERVAL = 300  # 5 minutes
-NWS_ACTIVE_INTERVAL = 120  # 2 minutes
+NWS_NORMAL_INTERVAL_MINUTES = 5
+NWS_ACTIVE_INTERVAL_SECONDS = 120
 
-def check_nws_alerts(ser, zone, settings):
+def check_nws_alerts(ser, zone, settings, force=False):
     global last_alert_id, last_nws_pull
-    now = time.time()
+    now = datetime.now()
     if last_nws_pull is None:
-        last_nws_pull = 0
-
-    # Determine interval
-    interval = NWS_NORMAL_INTERVAL
-    if last_alert_id is not None:
-        interval = NWS_ACTIVE_INTERVAL
-
-    if now - last_nws_pull < interval:
-        return  # Skip this pull
-
-    last_nws_pull = now
-    alert_texts = []
-
+        last_nws_pull = datetime.min
+    poll_now = False
+    if force:
+        poll_now = True
+    elif last_alert_id is not None and (datetime.now() - last_nws_pull).total_seconds() >= NWS_ACTIVE_INTERVAL_SECONDS:
+        poll_now = True
+    elif now.minute % NWS_NORMAL_INTERVAL_MINUTES == 0 and (datetime.now() - last_nws_pull).total_seconds() >= 60:
+        poll_now = True
+    if not poll_now:
+        return
+    last_nws_pull = datetime.now()
     try:
         url = f"https://api.weather.gov/alerts/active?zone={zone}"
         response = requests.get(url, timeout=5)
-        log(f"NWS pull response status: {response.status_code}", settings)
+        log(f"NWS pull status: {response.status_code}", settings)
+        log(f"NWS pull response data: {json.dumps(response.json())}", settings)
         data = response.json()
-        log(f"NWS pull response data: {json.dumps(data)}", settings)
         alerts = data.get("features", [])
         if alerts:
             latest = alerts[0]["id"]
@@ -361,14 +313,17 @@ def check_nws_alerts(ser, zone, settings):
                 last_alert_id = latest
                 headline = alerts[0]["properties"]["headline"]
                 desc = alerts[0]["properties"]["description"]
-                alert_texts.append(f"NWS: {headline} || {desc}")
+                alert_text = f"NWS: {headline} || {desc}"
+                send_message(ser, alert_text)
                 log(f"NWS alert active: {headline} || {desc}", settings)
+        else:
+            last_alert_id = None
     except Exception as e:
         log(f"Error fetching NWS alerts: {e}", settings)
         traceback.print_exc()
 
 # -----------------------------
-# Forecast sender with retry (+1 minute bug fixed)
+# Forecast sender
 # -----------------------------
 def send_forecast(ser, settings, now=None):
     if now is None:
@@ -377,7 +332,6 @@ def send_forecast(ser, settings, now=None):
     api_key = settings.get("API_KEY","")
     zip_code = settings.get("ZIP_CODE","")
     forecast_times = get_next_forecast_times(now)
-
     try:
         daily_forecast = defaultdict(list)
         if api_type=="OpenWeather":
@@ -395,7 +349,6 @@ def send_forecast(ser, settings, now=None):
                 for entry in timeline.get("intervals",[]):
                     dt = datetime.fromisoformat(entry.get("startTime"))
                     daily_forecast[dt.date()].append(entry.get("values",{}))
-
         today_blocks = []
         for i, f_time in enumerate(forecast_times):
             entries = daily_forecast.get(f_time.date(), [])
@@ -405,7 +358,6 @@ def send_forecast(ser, settings, now=None):
             else:
                 entry = min(entries, key=lambda x: abs(datetime.fromisoformat(x.get("startTime","1970-01-01T00:00:00")) - f_time))
             today_blocks.append(build_forecast_string(entry, f_time, api_type))
-
         future_blocks = []
         future_days = sorted(daily_forecast.keys())
         future_days = [d for d in future_days if d>now.date()][:5]
@@ -423,13 +375,11 @@ def send_forecast(ser, settings, now=None):
                     conditions.append("N/A")
             most_common = Counter(conditions).most_common(1)[0][0]
             future_blocks.append(f"{day.strftime('%a %m/%d/%y')} {most_common} {min(temps_min)}F/{max(temps_max)}F")
-
         colored_text = build_colored_blocks(today_blocks,"today")+build_colored_blocks(future_blocks,"future")
         next_update_candidates = [t for t in forecast_times[1:]]
         if next_update_candidates:
             next_update = next_update_candidates[0]
             colored_text += f" || Next update: {next_update.strftime('%m/%d/%y %I:%M %p').lstrip('0')}"
-
         start_time = time.time()
         max_retry_seconds = 300
         while True:
@@ -444,7 +394,6 @@ def send_forecast(ser, settings, now=None):
                     print("❌ Failed to send forecast after 5 minutes. Waiting until next scheduled update.")
                     break
                 time.sleep(10)
-
     except Exception:
         print("Error sending forecast:")
         traceback.print_exc()
@@ -458,6 +407,52 @@ def show_exit_message(ser):
     send_message(ser,f"Check Program || {dt}")
 
 # -----------------------------
+# NHC Hurricane Polling
+# -----------------------------
+last_nhc_pull = None
+NHC_UTC_HOURS = [3, 9, 15, 21]
+NHC_URL = "https://www.nhc.noaa.gov/CurrentStorms.json"
+
+def check_nhc_storms(settings, force=False):
+    global last_nhc_pull
+    now = datetime.now(timezone.utc)
+    if last_nhc_pull is None:
+        last_nhc_pull = datetime.min
+    poll_now = False
+    if force:
+        poll_now = True
+    else:
+        next_poll = last_nhc_pull + timedelta(hours=6)
+        if now >= next_poll and now.hour in NHC_UTC_HOURS and now.minute == 0:
+            poll_now = True
+    if not poll_now:
+        return
+    last_nhc_pull = now
+    try:
+        response = requests.get(NHC_URL, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            hurricanes = [s for s in data.get("activeStorms", []) if s.get("classification","") == "HU"]
+            if hurricanes:
+                log(f"NHC Active Hurricanes: {json.dumps(hurricanes)}", settings)
+            else:
+                log("NHC No active hurricanes", settings)
+        else:
+            log(f"NHC pull failed with status {response.status_code}", settings)
+    except Exception as e:
+        log(f"Error fetching NHC storms: {e}", settings)
+        traceback.print_exc()
+
+def nhc_poll_thread(settings):
+    while True:
+        now = datetime.now(timezone.utc)
+        if now.hour in NHC_UTC_HOURS and now.minute == 0:
+            check_nhc_storms(settings)
+            time.sleep(60)
+        else:
+            time.sleep(30)
+
+# -----------------------------
 # Main Loop
 # -----------------------------
 def main():
@@ -469,9 +464,16 @@ def main():
     ser = init_serial(settings["COM_PORT"])
     atexit.register(show_exit_message, ser)
 
+    # Initial forced polls
+    check_nws_alerts(ser, settings.get("FORECAST_ZONE",""), settings, force=True)
+    check_nhc_storms(settings, force=True)
+
+    # Start NHC polling thread
+    nhc_thread = threading.Thread(target=nhc_poll_thread, args=(settings,), daemon=True)
+    nhc_thread.start()
+
     try:
         now = datetime.now()
-        check_nws_alerts(ser, settings.get("FORECAST_ZONE",""), settings)
         send_forecast(ser, settings, now)
 
         while True:
