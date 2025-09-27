@@ -314,7 +314,6 @@ def check_nws_alerts(ser, zone, settings, force=False):
                 headline = alerts[0]["properties"]["headline"]
                 desc = alerts[0]["properties"]["description"]
                 alert_text = f"NWS: {headline} || {desc}"
-                send_message(ser, alert_text)
                 log(f"NWS alert active: {headline} || {desc}", settings)
         else:
             last_alert_id = None
