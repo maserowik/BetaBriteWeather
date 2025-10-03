@@ -4,7 +4,6 @@ import requests
 from datetime import datetime, timedelta
 import os
 import json
-import atexit
 from collections import defaultdict, Counter
 import traceback
 import sys
@@ -275,11 +274,11 @@ def init_serial(port, baud=9600):
 
 FS = "\x1C"
 colors_today = ["3"]  # green
-colors_future = ["1", "4", "5", "6", "7", "8"]
-alert_color = "2"  # red
+colors_future = ["4", "5", "6", "7", "8"]
+alert_color = "1"  # red
 
 
-def send_message(ser, text, mode="a"):
+def send_message(ser, text, mode="a", settings=None):
     NUL = b'\x00'
     SOH = b'\x01'
     STX = b'\x02'
@@ -291,7 +290,7 @@ def send_message(ser, text, mode="a"):
     ser.write(packet)
     ser.flush()
     time.sleep(0.2)
-    log(f"Sent to BetaBrite: {packet}", settings={"LOGGING_ON": True})
+    log(f"Sent to BetaBrite: {text}", settings)
 
 
 # -----------------------------
@@ -307,7 +306,8 @@ def get_next_forecast_times(now=None):
     while len(forecast_times) < 3:
         next_hour = min([h for h in SCHEDULED_HOURS if h > candidate.hour], default=None)
         if next_hour is None:
-            candidate = candidate.replace(hour=SCHEDULED_HOURS[0], minute=0, second=0, microsecond=0) + timedelta(days=1)
+            candidate = candidate.replace(hour=SCHEDULED_HOURS[0], minute=0, second=0, microsecond=0) + timedelta(
+                days=1)
         else:
             candidate = candidate.replace(hour=next_hour, minute=0, second=0, microsecond=0)
         forecast_times.append(candidate)
@@ -336,7 +336,7 @@ def build_colored_blocks(blocks, mode="future"):
 
 
 # -----------------------------
-# NWS Alerts (unchanged)
+# NWS Alerts
 # -----------------------------
 last_alert_id = None
 last_nws_pull = None
@@ -384,7 +384,7 @@ def check_nws_alerts(ser, zone, settings, force=False):
 
 
 # -----------------------------
-# NHC Hurricane Polling (local time)
+# NHC Hurricane Polling
 # -----------------------------
 last_nhc_pull = datetime.min
 NHC_HOURS = [3, 9, 15, 21]
@@ -495,12 +495,12 @@ def send_forecast(ser, settings, now=None):
         # Append NHC hurricanes in red if active
         if nhc_active_names:
             hurricane_text = ", ".join(nhc_active_names)
-            colored_text += FS + alert_color + f" || NHC Hurricane(s): {hurricane_text}"
+            colored_text += f" ||{FS}{alert_color} NHC Hurricane(s): {hurricane_text}{FS}3"
         start_time = time.time()
         max_retry_seconds = 300
         while True:
             try:
-                send_message(ser, colored_text)
+                send_message(ser, colored_text, settings=settings)
                 log(f"Forecast sent: {colored_text}", settings)
                 break
             except Exception as e:
@@ -519,9 +519,22 @@ def send_forecast(ser, settings, now=None):
 # -----------------------------
 # Exit cleanup
 # -----------------------------
-def show_exit_message(ser):
-    dt = datetime.now().strftime("%m/%d/%y %I:%M %p").lstrip("0")
-    send_message(ser, f"Check Program || {dt}")
+def show_exit_message(ser, settings):
+    try:
+        if ser and ser.is_open:
+            dt = datetime.now().strftime("%m/%d/%y %I:%M %p")
+            parts = dt.split(' ')
+            parts[0] = parts[0].lstrip('0').replace('/0', '/')
+            formatted_dt = ' '.join(parts)
+
+            message = f"{FS}1Check Program || {formatted_dt}"
+            send_message(ser, message, settings=settings)
+            log(f"Exit message sent: Check Program || {formatted_dt}", settings)
+            print(f"Exit message sent: Check Program || {formatted_dt}")
+            time.sleep(1)
+    except Exception as e:
+        print(f"Could not send exit message: {e}")
+        log(f"Error sending exit message: {e}", settings)
 
 
 # -----------------------------
@@ -534,7 +547,6 @@ def main():
     save_settings(settings)
 
     ser = init_serial(settings["COM_PORT"])
-    atexit.register(show_exit_message, ser)
 
     # Initial forced polls
     check_nws_alerts(ser, settings.get("FORECAST_ZONE", ""), settings, force=True)
@@ -555,8 +567,23 @@ def main():
                 send_forecast(ser, settings, now)
             time.sleep(60)
     except KeyboardInterrupt:
-        print("Exiting program...")
+        print("\nExiting program...")
+        show_exit_message(ser, settings)
+        if ser and ser.is_open:
+            ser.close()
         sys.exit(0)
+    except Exception as e:
+        print(f"Error in main loop: {e}")
+        traceback.print_exc()
+        log(f"Error in main loop: {e}", settings)
+        show_exit_message(ser, settings)
+        if ser and ser.is_open:
+            ser.close()
+        sys.exit(1)
+    finally:
+        if ser and ser.is_open:
+            show_exit_message(ser, settings)
+            ser.close()
 
 
 if __name__ == "__main__":
