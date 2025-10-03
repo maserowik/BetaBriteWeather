@@ -55,12 +55,15 @@ def rotate_logs():
     if os.path.exists(LOG_FILE):
         size_kb = os.path.getsize(LOG_FILE) / 1024
         if size_kb >= MAX_LOG_SIZE_KB:
+            # Shift old logs up (4.log -> 5.log, etc.)
             for i in reversed(range(1, MAX_LOG_DAYS)):
-                src = f"{LOG_FILE}.{i}"
-                dst = f"{LOG_FILE}.{i + 1}"
+                src = f"{i}.log"
+                dst = f"{i + 1}.log"
                 if os.path.exists(src):
                     os.replace(src, dst)
-            shutil.move(LOG_FILE, f"{LOG_FILE}.1")
+            # Move current log into 1.log
+            shutil.move(LOG_FILE, "1.log")
+
 
 
 def log(msg, settings=None):
