@@ -554,6 +554,9 @@ class BetaBrite:
             hex_repr = ' '.join(f'{b:02X}' for b in packet)
             Logger.log(f"BetaBrite FULL HEX: {hex_repr}", settings)
             Logger.log(f"BetaBrite FULL TEXT: {text}", settings)
+        else:
+            # Normal logging - log complete text without truncation
+            Logger.log(f"Sent to BetaBrite: {text}", settings)
 
         start_time = time.time()
 
@@ -562,9 +565,6 @@ class BetaBrite:
                 self.ser.write(packet)
                 self.ser.flush()
                 time.sleep(SERIAL_WRITE_DELAY)
-                # Only log truncated version if NOT doing full logging
-                if not settings or not settings.get("FULL_BETABRITE_LOGGING"):
-                    Logger.log(f"Sent to BetaBrite: {text[:80]}...", settings)
                 return True
             except (serial.SerialException, OSError) as e:
                 elapsed = time.time() - start_time
@@ -960,7 +960,10 @@ def main():
         do_fresh_poll(betabrite, settings, f"(Startup at {now.strftime('%I:%M %p')})")
         state.set_last_forecast_hour(now.hour)
     else:
-        print(f"  Display OFF - will activate at {settings['ON_TIME']}\n")
+        # Display is OFF - clear any existing message
+        print(f"  Display OFF - clearing display\n")
+        clear_display(betabrite, settings)
+        print(f"  Will activate at {settings['ON_TIME']}\n")
 
     next_nws_check = get_next_nws_check(now, False)
 
