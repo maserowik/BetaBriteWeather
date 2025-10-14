@@ -717,7 +717,11 @@ def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] 
         # Build display text
         colored_text = build_colored_blocks(today_blocks, "today") + build_colored_blocks(future_blocks, "future")
         next_update = get_next_forecast_update(now)
+<<<<<<< HEAD
         next_update_str = next_update.strftime("%I:%M %p").lstrip('0').replace(' 0', ' ')
+=======
+        next_update_str = next_update.strftime("%m/%d/%y %I:%M %p").lstrip('0').replace(' 0', ' ')
+>>>>>>> 62841f3 (Fix Date)
         update_text = f" || Next Update: {next_update_str}"
 
         # Add NHC hurricanes
