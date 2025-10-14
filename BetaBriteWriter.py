@@ -14,6 +14,9 @@ from abc import ABC, abstractmethod
 import argparse
 import logging
 from logging.handlers import RotatingFileHandler
+from dateutil.parser import isoparse
+import pytz
+import time as time_module
 
 # ==================== CONSTANTS ====================
 SETTINGS_FILE = "BetaBriteWriter.json"
@@ -58,19 +61,49 @@ TOMORROW_WEATHER_CODES = {
     7102: "Light Ice Pellets", 8000: "Thunderstorm"
 }
 
+DEFAULT_TIMEZONE = pytz.timezone("America/New_York")
+
+# Auto-detect timezone
+try:
+    if hasattr(time_module, 'tzname') and time_module.tzname[0]:
+        local_tz_name = time_module.tzname[time_module.daylight]
+        DEFAULT_TIMEZONE = pytz.timezone(local_tz_name)
+    else:
+        DEFAULT_TIMEZONE = pytz.timezone("America/New_York")
+except:
+    DEFAULT_TIMEZONE = pytz.timezone("America/New_York")
+
+MAX_DISPLAY_MESSAGE_SIZE = 2048
+
+# ==================== HELPER FUNCTIONS ====================
+def aggregate_temperatures(entries: List[Dict]) -> Tuple[int, int]:
+    if not entries:
+        return 0, 0
+    temps_min = [int(entry["main"]["temp_min"]) for entry in entries]
+    temps_max = [int(entry["main"]["temp_max"]) for entry in entries]
+    return min(temps_min), max(temps_max)
 
 # ==================== GLOBAL STATE ====================
 class ThreadSafeState:
     def __init__(self):
         self._lock = threading.Lock()
+        self.last_forecast_update: Optional[datetime] = None
         self.last_alert_id: Optional[str] = None
         self.last_nws_pull: datetime = datetime.min
         self.last_nhc_pull: datetime = datetime.min
         self.nhc_active_names: List[str] = []
         self.nws_active_headlines: List[str] = []
-        self.shutdown_event = threading.Event()
         self.display_was_active: Optional[bool] = None
         self.last_forecast_hour: Optional[int] = None
+        self.shutdown_event = threading.Event()
+
+    def set_last_forecast_update(self, update_time: datetime):
+        with self._lock:
+            self.last_forecast_update = update_time
+
+    def get_last_forecast_update(self) -> Optional[datetime]:
+        with self._lock:
+            return self.last_forecast_update
 
     def set_last_forecast_hour(self, hour: int):
         with self._lock:
@@ -88,6 +121,22 @@ class ThreadSafeState:
         with self._lock:
             return self.last_alert_id
 
+    def set_nws_headlines(self, headlines: List[str]):
+        with self._lock:
+            self.nws_active_headlines = headlines.copy()
+
+    def get_nws_headlines(self) -> List[str]:
+        with self._lock:
+            return self.nws_active_headlines.copy()
+
+    def set_nhc_names(self, names: List[str]):
+        with self._lock:
+            self.nhc_active_names = names.copy()
+
+    def get_nhc_names(self) -> List[str]:
+        with self._lock:
+            return self.nhc_active_names.copy()
+
     def update_nws_pull(self):
         with self._lock:
             self.last_nws_pull = datetime.now()
@@ -103,22 +152,6 @@ class ThreadSafeState:
     def get_nhc_pull_time(self) -> datetime:
         with self._lock:
             return self.last_nhc_pull
-
-    def set_nhc_names(self, names: List[str]):
-        with self._lock:
-            self.nhc_active_names = names.copy()
-
-    def get_nhc_names(self) -> List[str]:
-        with self._lock:
-            return self.nhc_active_names.copy()
-
-    def set_nws_headlines(self, headlines: List[str]):
-        with self._lock:
-            self.nws_active_headlines = headlines.copy()
-
-    def get_nws_headlines(self) -> List[str]:
-        with self._lock:
-            return self.nws_active_headlines.copy()
 
     def set_display_state(self, was_active: bool):
         with self._lock:
@@ -231,7 +264,7 @@ class Validator:
         if not api_key:
             return False
         test_zip = "10001"
-        url = f"http://api.openweathermap.org/data/2.5/weather?zip={test_zip},US&appid={api_key}"
+        url = f"http://api.openweathermap.org/data/2.5/forecast?zip={test_zip},US&appid={api_key}"
         for attempt in range(MAX_API_RETRIES):
             try:
                 response = requests.get(url, timeout=5)
@@ -247,7 +280,7 @@ class Validator:
             return False
         if not api_key:
             return False
-        url = f"http://api.openweathermap.org/data/2.5/weather?zip={zip_code},US&appid={api_key}"
+        url = f"http://api.openweathermap.org/data/2.5/forecast?zip={zip_code},US&appid={api_key}"
         for attempt in range(MAX_API_RETRIES):
             try:
                 response = requests.get(url, timeout=5)
@@ -284,7 +317,7 @@ class Validator:
 # ==================== TIME MANAGEMENT ====================
 def is_display_active(settings: Dict, now: Optional[datetime] = None) -> bool:
     if now is None:
-        now = datetime.now()
+        now = datetime.now(DEFAULT_TIMEZONE)
 
     current_time = now.time()
     on_time = datetime.strptime(settings["ON_TIME"], "%H:%M").time()
@@ -314,6 +347,10 @@ def get_forecast_times(now: datetime) -> List[datetime]:
     Get forecast times: current time + next 2 scheduled hours
     If at a scheduled hour, use that + next 2
     """
+    # Ensure now is timezone-aware
+    if now.tzinfo is None:
+        now = DEFAULT_TIMEZONE.localize(now)
+
     times = []
 
     # Check if we're at a scheduled hour (within first 5 minutes)
@@ -398,39 +435,44 @@ def should_check_nhc(now: datetime, last_check: datetime) -> bool:
     return True
 
 
+# ==================== RETRY LOGIC ====================
+def retry_request(func, *args, **kwargs):
+    for attempt in range(MAX_API_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt < MAX_API_RETRIES - 1:
+                time.sleep(API_RETRY_DELAY)
+            else:
+                raise e
+
+
 # ==================== WEATHER API ====================
 class WeatherAPI(ABC):
     def __init__(self, api_key: str, zip_code: str):
         self.api_key = api_key
         self.zip_code = zip_code
+        self.headers = {"User-Agent": "BetaBriteWeather/1.0"}
 
     @abstractmethod
     def get_forecast_data(self) -> Dict:
         pass
 
     @abstractmethod
-    def parse_forecast(self, data: Dict, forecast_times: List[datetime]) -> Tuple[List[str], List[str]]:
+    def parse_forecast(self, data: Dict, forecast_times: List[datetime], settings: Dict) -> Tuple[List[str], List[str]]:
         pass
 
 
 class OpenWeatherAPI(WeatherAPI):
     def get_forecast_data(self) -> Dict:
         url = f"http://api.openweathermap.org/data/2.5/forecast?zip={self.zip_code},us&units=imperial&appid={self.api_key}"
-        for attempt in range(MAX_API_RETRIES):
-            try:
-                response = requests.get(url, timeout=10)
-                response.raise_for_status()
-                return response.json()
-            except requests.RequestException as e:
-                if attempt < MAX_API_RETRIES - 1:
-                    time.sleep(API_RETRY_DELAY)
-                else:
-                    raise
+        return retry_request(requests.get, url, headers=self.headers, timeout=10).json()
 
-    def parse_forecast(self, data: Dict, forecast_times: List[datetime]) -> Tuple[List[str], List[str]]:
+    def parse_forecast(self, data: Dict, forecast_times: List[datetime], settings: Dict) -> Tuple[List[str], List[str]]:
         daily_forecast = defaultdict(list)
         for entry in data.get("list", []):
-            dt = datetime.fromtimestamp(entry["dt"])
+            # FIXED: Convert to local timezone
+            dt = datetime.fromtimestamp(entry["dt"], tz=pytz.UTC).astimezone(DEFAULT_TIMEZONE)
             daily_forecast[dt.date()].append(entry)
 
         today_blocks = []
@@ -438,14 +480,15 @@ class OpenWeatherAPI(WeatherAPI):
             entries = daily_forecast.get(f_time.date(), [])
             if not entries:
                 continue
-            entry = min(entries, key=lambda x: abs(datetime.fromtimestamp(x["dt"]) - f_time))
+            entry = min(entries, key=lambda x: abs(datetime.fromtimestamp(x["dt"], tz=pytz.UTC).astimezone(DEFAULT_TIMEZONE) - f_time))
             desc = entry["weather"][0]["main"]
-            t_min = int(entry["main"]["temp_min"])
-            t_max = int(entry["main"]["temp_max"])
-            today_blocks.append(f"{f_time.strftime('%I:%M %p %a %m/%d/%y ')} {desc} {t_min}F/{t_max}F")
+            t_min, t_max = aggregate_temperatures(entries)
+            today_blocks.append(f"{f_time.strftime('%I:%M %p %a %m/%d/%y')} {desc} {t_min}F/{t_max}F")
+
+        Logger.log(f"Parsed Today Blocks: {today_blocks}", settings)
 
         future_blocks = []
-        now = datetime.now()
+        now = datetime.now(DEFAULT_TIMEZONE)
         future_days = sorted([d for d in daily_forecast.keys() if d > now.date()])[:5]
         for day in future_days:
             temps_min, temps_max, conditions = [], [], []
@@ -462,28 +505,19 @@ class OpenWeatherAPI(WeatherAPI):
 class TomorrowAPI(WeatherAPI):
     def get_forecast_data(self) -> Dict:
         url = f"https://api.tomorrow.io/v4/timelines?location={self.zip_code}&fields=temperature,weatherCode&units=imperial&timesteps=1h&apikey={self.api_key}"
-        for attempt in range(MAX_API_RETRIES):
-            try:
-                response = requests.get(url, timeout=10)
-                response.raise_for_status()
-                return response.json()
-            except requests.RequestException as e:
-                if attempt < MAX_API_RETRIES - 1:
-                    time.sleep(API_RETRY_DELAY)
-                else:
-                    raise
+        return retry_request(requests.get, url, headers=self.headers, timeout=10).json()
 
     def _get_weather_description(self, code: int) -> str:
         return TOMORROW_WEATHER_CODES.get(code, "Unknown")
 
-    def parse_forecast(self, data: Dict, forecast_times: List[datetime]) -> Tuple[List[str], List[str]]:
+    def parse_forecast(self, data: Dict, forecast_times: List[datetime], settings: Dict) -> Tuple[List[str], List[str]]:
         daily_forecast = defaultdict(list)
         for timeline in data.get("data", {}).get("timelines", []):
             for entry in timeline.get("intervals", []):
                 dt_str = entry.get("startTime", "")
                 if not dt_str:
                     continue
-                dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+                dt = isoparse(dt_str)
                 daily_forecast[dt.date()].append({"dt": dt, "values": entry.get("values", {})})
 
         today_blocks = []
@@ -495,10 +529,10 @@ class TomorrowAPI(WeatherAPI):
             values = entry["values"]
             desc = self._get_weather_description(values.get("weatherCode", 0))
             temp = int(values.get("temperature", 0))
-            today_blocks.append(f"{f_time.strftime('%I:%M %p %a %m/%d/%y ')} {desc} {temp}F/{temp}F")
+            today_blocks.append(f"{f_time.strftime('%I:%M %p %a %m/%d/%y')} {desc} {temp}F/{temp}F")
 
         future_blocks = []
-        now = datetime.now()
+        now = datetime.now(DEFAULT_TIMEZONE)
         future_days = sorted([d for d in daily_forecast.keys() if d > now.date()])[:5]
         for day in future_days:
             temps, weather_codes = [], []
@@ -595,7 +629,8 @@ class NWSAlerts:
         state.update_nws_pull()
         try:
             url = f"https://api.weather.gov/alerts/active?zone={zone}"
-            response = requests.get(url, timeout=10)
+            headers = {"User-Agent": "BetaBriteWeather/1.0"}
+            response = requests.get(url, headers=headers, timeout=10)
             if settings.get("FULL_NWS_LOGGING"):
                 Logger.log(f"NWS full response: {response.text}", settings)
             response.raise_for_status()
@@ -624,7 +659,8 @@ class NHCMonitor:
         """Check NHC storms - ATLANTIC BASIN ONLY"""
         state.update_nhc_pull()
         try:
-            response = requests.get(NHC_URL, timeout=10)
+            headers = {"User-Agent": "BetaBriteWeather/1.0"}
+            response = requests.get(NHC_URL, headers=headers, timeout=10)
             if settings.get("FULL_NHC_LOGGING"):
                 Logger.log(f"NHC full response: {response.text}", settings)
             response.raise_for_status()
@@ -652,89 +688,66 @@ class NHCMonitor:
 def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] = None):
     """Send complete forecast with alerts"""
     if now is None:
-        now = datetime.now()
+        now = datetime.now(DEFAULT_TIMEZONE)
 
-    api_type = settings.get("API_TYPE", "OpenWeather")
-    api_key = settings.get("API_KEY", "")
-    zip_code = settings.get("ZIP_CODE", "")
-
-    if not api_key or not zip_code:
-        print("API key or ZIP code not configured")
+    last_update = state.get_last_forecast_update()
+    if last_update and (now - last_update).total_seconds() < 300:
+        print("Skipping duplicate forecast update.")
         return
 
     try:
+        state.set_last_forecast_update(now)
+
         # Get forecast times
         forecast_times = get_forecast_times(now)
 
         # Fetch weather data
-        if api_type == "OpenWeather":
-            api = OpenWeatherAPI(api_key, zip_code)
+        if settings.get("API_TYPE") == "OpenWeather":
+            api = OpenWeatherAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
         else:
-            api = TomorrowAPI(api_key, zip_code)
+            api = TomorrowAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
 
         data = api.get_forecast_data()
 
         if settings.get("FULL_API_LOGGING"):
-            Logger.log(f"{api_type} response: {json.dumps(data)}", settings)
+            Logger.log(f"{api.__class__.__name__} response: {json.dumps(data)}", settings)
 
-        today_blocks, future_blocks = api.parse_forecast(data, forecast_times)
+        today_blocks, future_blocks = api.parse_forecast(data, forecast_times, settings)
 
         # Build display text
         colored_text = build_colored_blocks(today_blocks, "today") + build_colored_blocks(future_blocks, "future")
+        next_update = get_next_forecast_update(now)
+        next_update_str = next_update.strftime("%I:%M %p").lstrip('0').replace(' 0', ' ')
+        update_text = f" || Next Update: {next_update_str}"
 
         # Add NHC hurricanes
         nhc_names = state.get_nhc_names()
-        if nhc_names:
-            hurricane_text = ", ".join(nhc_names)
-            colored_text += f" || {FS}{ALERT_COLOR}NHC Atlantic Hurricane(s): {hurricane_text}"
+        nhc_text = f" || {FS}{ALERT_COLOR}NHC Atlantic Hurricane(s): {', '.join(nhc_names)}" if nhc_names else ""
 
         # Add NWS alerts at the END
         nws_headlines = state.get_nws_headlines()
-        if nws_headlines:
-            for headline in nws_headlines:
-                colored_text += f" || {FS}{ALERT_COLOR}NWS Alert: {headline}"
+        nws_text = "".join([f" || {FS}{ALERT_COLOR}NWS Alert: {headline}" for headline in nws_headlines])
 
-        # Add next update time at the very end
-        next_update = get_next_forecast_update(now)
-        next_update_str = next_update.strftime("%I:%M %p").lstrip('0').replace(' 0', ' ')
-        colored_text += f" || Next Update: {next_update_str}"
+        # Build complete message first
+        full_message = colored_text + update_text + nhc_text + nws_text
+
+        # Then truncate if needed, prioritizing today_blocks
+        if len(full_message) > MAX_DISPLAY_MESSAGE_SIZE:
+            truncated_future = build_colored_blocks(future_blocks[:3], "future")  # Limit future blocks
+            full_message = build_colored_blocks(today_blocks, "today") + truncated_future + update_text + nhc_text + nws_text
+            if len(full_message) > MAX_DISPLAY_MESSAGE_SIZE:
+                full_message = full_message[:MAX_DISPLAY_MESSAGE_SIZE - 3] + "..."
 
         # Send to display
-        betabrite.send_message(colored_text, settings=settings)
+        betabrite.send_message(full_message, settings=settings)
         Logger.log("Forecast sent", settings)
         print(f"Forecast updated at {now.strftime('%I:%M %p')}")
 
     except Exception as e:
+        state.set_last_forecast_update(None)
         Logger.log(f"Forecast error: {e}", settings)
         print(f"Error sending forecast: {e}")
         traceback.print_exc()
-
-
-def do_fresh_poll(betabrite: BetaBrite, settings: Dict, reason: str = ""):
-    """Do complete fresh poll of all APIs"""
-    now = datetime.now()
-    print(f"\n{'=' * 50}")
-    print(f"FRESH POLL {reason}")
-    print(f"{'=' * 50}")
-
-    # Poll NWS
-    zone = settings.get("FORECAST_ZONE", "")
-    if zone:
-        print("Checking NWS alerts...")
-        NWSAlerts.check_alerts(zone, settings)
-
-    # Poll NHC
-    print("Checking NHC storms...")
-    NHCMonitor.check_storms(settings)
-
-    # Send forecast
-    print("Fetching forecast...")
-    send_forecast(betabrite, settings, now)
-
-    # Show next update time
-    next_update = get_next_forecast_update(now)
-    print(f"Next forecast update: {next_update.strftime('%I:%M %p')}")
-    print(f"{'=' * 50}\n")
 
 
 # ==================== CLI ====================
@@ -756,13 +769,13 @@ def validate_headless_settings(args: argparse.Namespace) -> Dict:
 
     errors = []
     if not args.com or not Validator.com_port(args.com):
-        errors.append("Invalid COM port")
+        errors.append("Invalid COM port. Ensure the device is connected and the port is correct.")
     if not args.api_key or not Validator.api_key(args.api_key):
-        errors.append("Invalid API key")
+        errors.append("Invalid API key. Check your API provider for the correct key.")
     if not args.zip or not Validator.zip_code(args.zip, args.api_key or ""):
-        errors.append("Invalid ZIP code")
+        errors.append("Invalid ZIP code. Ensure it is a valid 5-digit US ZIP code.")
     if not args.zone or not Validator.forecast_zone(args.zone):
-        errors.append("Invalid forecast zone")
+        errors.append("Invalid forecast zone. Check the National Weather Service for valid zones.")
 
     if errors:
         for error in errors:
@@ -920,6 +933,33 @@ def show_exit_message(betabrite: BetaBrite, settings: Dict):
     except Exception as e:
         print(f"Exit message error: {e}")
         traceback.print_exc()
+
+
+def do_fresh_poll(betabrite: BetaBrite, settings: Dict, reason: str = ""):
+    """Do complete fresh poll of all APIs"""
+    now = datetime.now()
+    print(f"\n{'=' * 50}")
+    print(f"FRESH POLL {reason}")
+    print(f"{'=' * 50}")
+
+    # Poll NWS
+    zone = settings.get("FORECAST_ZONE", "")
+    if zone:
+        print("Checking NWS alerts...")
+        NWSAlerts.check_alerts(zone, settings)
+
+    # Poll NHC
+    print("Checking NHC storms...")
+    NHCMonitor.check_storms(settings)
+
+    # Send forecast
+    print("Fetching forecast...")
+    send_forecast(betabrite, settings, now)
+
+    # Show next update time
+    next_update = get_next_forecast_update(now)
+    print(f"Next forecast update: {next_update.strftime('%I:%M %p')}")
+    print(f"{'=' * 50}\n")
 
 
 def main():
