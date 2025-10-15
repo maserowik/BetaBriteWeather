@@ -96,6 +96,7 @@ class ThreadSafeState:
         self.nws_active_headlines: List[str] = []
         self.display_was_active: Optional[bool] = None
         self.last_forecast_hour: Optional[int] = None
+        self.last_forecast_message: str = ""
         self.shutdown_event = threading.Event()
 
     def set_last_forecast_update(self, update_time: datetime):
@@ -161,6 +162,14 @@ class ThreadSafeState:
     def get_display_state(self) -> Optional[bool]:
         with self._lock:
             return self.display_was_active
+
+    def set_last_forecast_message(self, message: str):
+        with self._lock:
+            self.last_forecast_message = message
+
+    def get_last_forecast_message(self) -> str:
+        with self._lock:
+            return self.last_forecast_message
 
     def shutdown(self):
         self.shutdown_event.set()
@@ -640,7 +649,7 @@ def build_colored_blocks(blocks: List[str], mode: str = "future") -> str:
 # ==================== ALERTS ====================
 class NWSAlerts:
     @staticmethod
-    def check_alerts(zone: str, settings: Dict):
+    def check_alerts(zone: str, settings: Dict, betabrite):
         """Check NWS alerts - only called when display is ON"""
         state.update_nws_pull()
         try:
@@ -661,6 +670,7 @@ class NWSAlerts:
                     state.set_alert_id(latest)
                     Logger.log(f"NWS alert: {headlines[0]}", settings)
                     print(f"NWS Alert: {headlines[0]}")
+                    send_forecast(betabrite, settings, update_alerts_only=True)  # Append alerts only
             else:
                 state.set_alert_id(None)
                 state.set_nws_headlines([])
@@ -693,6 +703,7 @@ class NHCMonitor:
                 state.set_nhc_names(names)
                 Logger.log(f"NHC Atlantic Hurricane(s): {', '.join(names)}", settings)
                 print(f"NHC Atlantic Hurricane(s): {', '.join(names)}")
+                send_forecast(betabrite, settings, update_alerts_only=True)  # Append alerts only
             else:
                 state.set_nhc_names([])
         except Exception as e:
@@ -701,40 +712,50 @@ class NHCMonitor:
 
 
 # ==================== FORECAST SENDER ====================
-def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] = None):
-    """Send complete forecast with alerts"""
+def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] = None, update_alerts_only: bool = False):
+    """Send complete forecast with alerts or append alerts only."""
     if now is None:
         now = datetime.now(DEFAULT_TIMEZONE)
 
-    last_update = state.get_last_forecast_update()
-    if last_update and (now - last_update).total_seconds() < 300:
-        print("Skipping duplicate forecast update.")
-        return
+    if not update_alerts_only:
+        last_update = state.get_last_forecast_update()
+        if last_update and (now - last_update).total_seconds() < 300:
+            print("Skipping duplicate forecast update.")
+            return
 
     try:
-        state.set_last_forecast_update(now)
+        if not update_alerts_only:
+            state.set_last_forecast_update(now)
 
-        # Get forecast times
-        forecast_times = get_forecast_times(now)
+            # Get forecast times
+            forecast_times = get_forecast_times(now)
 
-        # Fetch weather data
-        if settings.get("API_TYPE") == "OpenWeather":
-            api = OpenWeatherAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
+            # Fetch weather data
+            if settings.get("API_TYPE") == "OpenWeather":
+                api = OpenWeatherAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
+            else:
+                api = TomorrowAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
+
+            data = api.get_forecast_data()
+
+            if settings.get("FULL_API_LOGGING"):
+                Logger.log(f"{api.__class__.__name__} response: {json.dumps(data)}", settings)
+
+            today_blocks, future_blocks = api.parse_forecast(data, forecast_times, settings)
+
+            # Build display text
+            colored_text = build_colored_blocks(today_blocks, "today") + build_colored_blocks(future_blocks, "future")
+            next_update = get_next_forecast_update(now)
+            next_update_str = next_update.strftime("%m/%d/%y %I:%M %p").lstrip('0').replace(' 0', ' ')
+            update_text = f" || Next Update: {next_update_str}"
+
+            # Store the forecast message
+            forecast_message = colored_text + update_text
+            state.set_last_forecast_message(forecast_message)
+
         else:
-            api = TomorrowAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
-
-        data = api.get_forecast_data()
-
-        if settings.get("FULL_API_LOGGING"):
-            Logger.log(f"{api.__class__.__name__} response: {json.dumps(data)}", settings)
-
-        today_blocks, future_blocks = api.parse_forecast(data, forecast_times, settings)
-
-        # Build display text
-        colored_text = build_colored_blocks(today_blocks, "today") + build_colored_blocks(future_blocks, "future")
-        next_update = get_next_forecast_update(now)
-        next_update_str = next_update.strftime("%m/%d/%y %I:%M %p").lstrip('0').replace(' 0', ' ')
-        update_text = f" || Next Update: {next_update_str}"
+            # Retrieve the last forecast message
+            forecast_message = state.get_last_forecast_message()
 
         # Add NHC hurricanes
         nhc_names = state.get_nhc_names()
@@ -744,10 +765,10 @@ def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] 
         nws_headlines = state.get_nws_headlines()
         nws_text = "".join([f" || {FS}{ALERT_COLOR}NWS Alert: {headline}" for headline in nws_headlines])
 
-        # Build complete message first
-        full_message = colored_text + update_text + nhc_text + nws_text
+        # Build complete message
+        full_message = forecast_message + nhc_text + nws_text
 
-        # Then truncate if needed, prioritizing today_blocks
+        # Truncate if needed
         if len(full_message) > MAX_DISPLAY_MESSAGE_SIZE:
             truncated_future = build_colored_blocks(future_blocks[:3], "future")  # Limit future blocks
             full_message = build_colored_blocks(today_blocks, "today") + truncated_future + update_text + nhc_text + nws_text
@@ -756,11 +777,12 @@ def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] 
 
         # Send to display
         betabrite.send_message(full_message, settings=settings)
-        Logger.log("Forecast sent", settings)
-        print(f"Forecast updated at {now.strftime('%I:%M %p')}")
+        Logger.log("Forecast sent" if not update_alerts_only else "Alerts updated", settings)
+        print(f"Forecast updated at {now.strftime('%I:%M %p')}" if not update_alerts_only else "Alerts appended to display")
 
     except Exception as e:
-        state.set_last_forecast_update(None)
+        if not update_alerts_only:
+            state.set_last_forecast_update(None)
         Logger.log(f"Forecast error: {e}", settings)
         print(f"Error sending forecast: {e}")
         traceback.print_exc()
@@ -962,7 +984,7 @@ def do_fresh_poll(betabrite: BetaBrite, settings: Dict, reason: str = ""):
     zone = settings.get("FORECAST_ZONE", "")
     if zone:
         print("Checking NWS alerts...")
-        NWSAlerts.check_alerts(zone, settings)
+        NWSAlerts.check_alerts(zone, settings, betabrite)
 
     # Poll NHC
     print("Checking NHC storms...")
@@ -1070,7 +1092,7 @@ def main():
                 if zone and now >= next_nws_check:
                     was_alert_active = state.get_alert_id() is not None
 
-                    NWSAlerts.check_alerts(zone, settings)
+                    NWSAlerts.check_alerts(zone, settings, betabrite)
 
                     is_alert_active = state.get_alert_id() is not None
 
