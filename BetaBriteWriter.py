@@ -21,8 +21,9 @@ import time as time_module
 # ==================== CONSTANTS ====================
 SETTINGS_FILE = "BetaBriteWriter.json"
 LOG_FILE = "BetaBriteWriter.log"
+LOG_FILE_PATTERN = "BetaBriteWriter.%d.log"  # Added pattern for numbered suffixes
 MAX_LOG_BACKUPS = 5
-MAX_LOG_BYTES = 2 * 1024 * 1024
+MAX_LOG_BYTES = 1024 * 1024  # 1 MB
 
 # Serial Protocol
 NUL = b'\x00'
@@ -229,11 +230,26 @@ def setup_logger(settings: Dict) -> logging.Logger:
     logger = logging.getLogger("BetaBrite")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
+
     if settings.get("LOGGING_ON"):
+        # Rotate logs on program start
+        for i in range(MAX_LOG_BACKUPS, 0, -1):
+            old_log = f"BetaBriteWriter.{i}.log"
+            new_log = f"BetaBriteWriter.{i + 1}.log"
+            if os.path.exists(old_log):
+                if i == MAX_LOG_BACKUPS:
+                    os.remove(old_log)  # Delete the oldest log
+                else:
+                    os.rename(old_log, new_log)  # Shift log numbers
+
+        if os.path.exists(LOG_FILE):
+            os.rename(LOG_FILE, "BetaBriteWriter.1.log")  # Rename current log to .1
+
         handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_BYTES, backupCount=MAX_LOG_BACKUPS)
         formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%m/%d/%y %I:%M %p')
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+
     return logger
 
 
