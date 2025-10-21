@@ -21,7 +21,7 @@ import time as time_module
 # ==================== CONSTANTS ====================
 SETTINGS_FILE = "BetaBriteWriter.json"
 LOG_FILE = "BetaBriteWriter.log"
-LOG_FILE_PATTERN = "BetaBriteWriter.%d.log"  # Added pattern for numbered suffixes
+LOG_FILE_PATTERN = "BetaBriteWriter.%d.log"
 MAX_LOG_BACKUPS = 5
 MAX_LOG_BYTES = 1024 * 1024  # 1 MB
 
@@ -76,6 +76,7 @@ except:
 
 MAX_DISPLAY_MESSAGE_SIZE = 2048
 
+
 # ==================== HELPER FUNCTIONS ====================
 def aggregate_temperatures(entries: List[Dict]) -> Tuple[int, int]:
     if not entries:
@@ -83,6 +84,7 @@ def aggregate_temperatures(entries: List[Dict]) -> Tuple[int, int]:
     temps_min = [int(entry["main"]["temp_min"]) for entry in entries]
     temps_max = [int(entry["main"]["temp_max"]) for entry in entries]
     return min(temps_min), max(temps_max)
+
 
 # ==================== GLOBAL STATE ====================
 class ThreadSafeState:
@@ -247,12 +249,12 @@ def setup_logger(settings: Dict) -> logging.Logger:
             new_log = f"BetaBriteWriter.{i + 1}.log"
             if os.path.exists(old_log):
                 if i == MAX_LOG_BACKUPS:
-                    os.remove(old_log)  # Delete the oldest log
+                    os.remove(old_log)
                 else:
-                    os.rename(old_log, new_log)  # Shift log numbers
+                    os.rename(old_log, new_log)
 
         if os.path.exists(LOG_FILE):
-            os.rename(LOG_FILE, "BetaBriteWriter.1.log")  # Rename current log to .1
+            os.rename(LOG_FILE, "BetaBriteWriter.1.log")
 
         handler = RotatingFileHandler(LOG_FILE, maxBytes=MAX_LOG_BYTES, backupCount=MAX_LOG_BACKUPS)
         formatter = logging.Formatter('[%(asctime)s] %(message)s', datefmt='%m/%d/%y %I:%M %p')
@@ -349,10 +351,8 @@ def is_display_active(settings: Dict, now: Optional[datetime] = None) -> bool:
     off_time = datetime.strptime(settings["OFF_TIME"], "%H:%M").time()
 
     if on_time < off_time:
-        # Normal case: ON=06:00, OFF=22:00 -> active between 06:00 and 22:00
         return on_time <= current_time < off_time
     else:
-        # Overnight case: ON=22:00, OFF=06:00 -> active from 22:00 to 06:00
         return current_time >= on_time or current_time < off_time
 
 
@@ -372,22 +372,18 @@ def get_forecast_times(now: datetime) -> List[datetime]:
     Get forecast times: current time + next 2 scheduled hours
     If at a scheduled hour, use that + next 2
     """
-    # Ensure now is timezone-aware
     if now.tzinfo is None:
         now = DEFAULT_TIMEZONE.localize(now)
 
     times = []
 
-    # Check if we're at a scheduled hour (within first 5 minutes)
     if now.hour in SCHEDULED_HOURS and now.minute < 5:
         current = now.replace(minute=0, second=0, microsecond=0)
     else:
-        # Use actual current time
         current = now
 
     times.append(current)
 
-    # Find next 2 scheduled hours
     current_hour = current.hour
     for _ in range(2):
         next_hours = [h for h in SCHEDULED_HOURS if h > current_hour]
@@ -409,13 +405,11 @@ def get_next_forecast_update(now: datetime) -> datetime:
     """Calculate next scheduled forecast update time"""
     current_hour = now.hour
 
-    # Find next scheduled hour
     next_hours = [h for h in SCHEDULED_HOURS if h > current_hour]
     if next_hours:
         next_hour = next_hours[0]
         return now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
     else:
-        # Next day at first scheduled hour
         next_hour = SCHEDULED_HOURS[0]
         return (now + timedelta(days=1)).replace(hour=next_hour, minute=0, second=0, microsecond=0)
 
@@ -423,14 +417,11 @@ def get_next_forecast_update(now: datetime) -> datetime:
 def get_next_nws_check(now: datetime, alert_active: bool) -> datetime:
     """Calculate next NWS check time"""
     if alert_active:
-        # Every 2 minutes when alert active
         return now + timedelta(minutes=2)
     else:
-        # Next 5-minute mark
         for m in NWS_SCHEDULED_MINUTES:
             if now.minute < m:
                 return now.replace(minute=m, second=0, microsecond=0)
-        # Next hour at :00
         next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         return next_time
 
@@ -440,7 +431,6 @@ def get_nearest_5min_mark(now: datetime) -> datetime:
     for m in NWS_SCHEDULED_MINUTES:
         if now.minute <= m:
             return now.replace(minute=m, second=0, microsecond=0)
-    # Next hour at :00
     return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 
@@ -449,11 +439,9 @@ def should_check_nhc(now: datetime, last_check: datetime) -> bool:
     if now.hour not in NHC_SCHEDULED_HOURS:
         return False
 
-    # Only check once per hour (within first 5 minutes)
     if now.minute >= 5:
         return False
 
-    # Don't check if we already checked this hour
     if last_check.hour == now.hour and last_check.date() == now.date():
         return False
 
@@ -496,7 +484,6 @@ class OpenWeatherAPI(WeatherAPI):
     def parse_forecast(self, data: Dict, forecast_times: List[datetime], settings: Dict) -> Tuple[List[str], List[str]]:
         daily_forecast = defaultdict(list)
         for entry in data.get("list", []):
-            # FIXED: Convert to local timezone
             dt = datetime.fromtimestamp(entry["dt"], tz=pytz.UTC).astimezone(DEFAULT_TIMEZONE)
             daily_forecast[dt.date()].append(entry)
 
@@ -505,7 +492,8 @@ class OpenWeatherAPI(WeatherAPI):
             entries = daily_forecast.get(f_time.date(), [])
             if not entries:
                 continue
-            entry = min(entries, key=lambda x: abs(datetime.fromtimestamp(x["dt"], tz=pytz.UTC).astimezone(DEFAULT_TIMEZONE) - f_time))
+            entry = min(entries, key=lambda x: abs(
+                datetime.fromtimestamp(x["dt"], tz=pytz.UTC).astimezone(DEFAULT_TIMEZONE) - f_time))
             desc = entry["weather"][0]["main"]
             t_min, t_max = aggregate_temperatures(entries)
             today_blocks.append(f"{f_time.strftime('%I:%M %p %a %m/%d/%y')} {desc} {t_min}F/{t_max}F")
@@ -608,13 +596,11 @@ class BetaBrite:
         packet = (NUL * 10 + SOH + b"Z00" + STX + b"AA" + ESC + SP + mode.encode() + text.encode("ascii",
                                                                                                  "ignore") + EOT)
 
-        # Full BetaBrite logging - log hex and full text
         if settings and settings.get("FULL_BETABRITE_LOGGING"):
             hex_repr = ' '.join(f'{b:02X}' for b in packet)
             Logger.log(f"BetaBrite FULL HEX: {hex_repr}", settings)
             Logger.log(f"BetaBrite FULL TEXT: {text}", settings)
         else:
-            # Normal logging - log complete text without truncation
             Logger.log(f"Sent to BetaBrite: {text}", settings)
 
         start_time = time.time()
@@ -670,7 +656,8 @@ class NWSAlerts:
                     state.set_alert_id(latest)
                     Logger.log(f"NWS alert: {headlines[0]}", settings)
                     print(f"NWS Alert: {headlines[0]}")
-                    send_forecast(betabrite, settings, update_alerts_only=True)  # Append alerts only
+                    # Only append alerts, don't fetch new forecast
+                    append_alerts_to_display(betabrite, settings)
             else:
                 state.set_alert_id(None)
                 state.set_nws_headlines([])
@@ -681,7 +668,7 @@ class NWSAlerts:
 
 class NHCMonitor:
     @staticmethod
-    def check_storms(settings: Dict):
+    def check_storms(settings: Dict, betabrite):
         """Check NHC storms - ATLANTIC BASIN ONLY"""
         state.update_nhc_pull()
         try:
@@ -692,7 +679,6 @@ class NHCMonitor:
             response.raise_for_status()
             data = response.json()
 
-            # Filter for Atlantic basin hurricanes only
             hurricanes = [
                 s for s in data.get("activeStorms", [])
                 if s.get("classification", "") == "HU" and s.get("basin", "").upper() == "AL"
@@ -703,7 +689,8 @@ class NHCMonitor:
                 state.set_nhc_names(names)
                 Logger.log(f"NHC Atlantic Hurricane(s): {', '.join(names)}", settings)
                 print(f"NHC Atlantic Hurricane(s): {', '.join(names)}")
-                send_forecast(betabrite, settings, update_alerts_only=True)  # Append alerts only
+                # Only append alerts, don't fetch new forecast
+                append_alerts_to_display(betabrite, settings)
             else:
                 state.set_nhc_names([])
         except Exception as e:
@@ -711,51 +698,15 @@ class NHCMonitor:
             print(f"NHC check failed: {e}")
 
 
-# ==================== FORECAST SENDER ====================
-def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] = None, update_alerts_only: bool = False):
-    """Send complete forecast with alerts or append alerts only."""
-    if now is None:
-        now = datetime.now(DEFAULT_TIMEZONE)
-
-    if not update_alerts_only:
-        last_update = state.get_last_forecast_update()
-        if last_update and (now - last_update).total_seconds() < 300:
-            print("Skipping duplicate forecast update.")
-            return
-
+def append_alerts_to_display(betabrite: BetaBrite, settings: Dict):
+    """Append alerts to existing forecast without fetching new weather data"""
     try:
-        if not update_alerts_only:
-            state.set_last_forecast_update(now)
+        # Get the stored forecast message
+        forecast_message = state.get_last_forecast_message()
 
-            # Get forecast times
-            forecast_times = get_forecast_times(now)
-
-            # Fetch weather data
-            if settings.get("API_TYPE") == "OpenWeather":
-                api = OpenWeatherAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
-            else:
-                api = TomorrowAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
-
-            data = api.get_forecast_data()
-
-            if settings.get("FULL_API_LOGGING"):
-                Logger.log(f"{api.__class__.__name__} response: {json.dumps(data)}", settings)
-
-            today_blocks, future_blocks = api.parse_forecast(data, forecast_times, settings)
-
-            # Build display text
-            colored_text = build_colored_blocks(today_blocks, "today") + build_colored_blocks(future_blocks, "future")
-            next_update = get_next_forecast_update(now)
-            next_update_str = next_update.strftime("%m/%d/%y %I:%M %p").lstrip('0').replace(' 0', ' ')
-            update_text = f" || Next Update: {next_update_str}"
-
-            # Store the forecast message
-            forecast_message = colored_text + update_text
-            state.set_last_forecast_message(forecast_message)
-
-        else:
-            # Retrieve the last forecast message
-            forecast_message = state.get_last_forecast_message()
+        if not forecast_message:
+            Logger.log("No stored forecast to append alerts to", settings)
+            return
 
         # Add NHC hurricanes
         nhc_names = state.get_nhc_names()
@@ -770,19 +721,84 @@ def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] 
 
         # Truncate if needed
         if len(full_message) > MAX_DISPLAY_MESSAGE_SIZE:
-            truncated_future = build_colored_blocks(future_blocks[:3], "future")  # Limit future blocks
-            full_message = build_colored_blocks(today_blocks, "today") + truncated_future + update_text + nhc_text + nws_text
+            full_message = full_message[:MAX_DISPLAY_MESSAGE_SIZE - 3] + "..."
+
+        # Send to display
+        betabrite.send_message(full_message, settings=settings)
+        Logger.log("Alerts appended to display", settings)
+        print("Alerts appended to display")
+
+    except Exception as e:
+        Logger.log(f"Error appending alerts: {e}", settings)
+        print(f"Error appending alerts: {e}")
+
+
+# ==================== FORECAST SENDER ====================
+def send_forecast(betabrite: BetaBrite, settings: Dict, now: Optional[datetime] = None):
+    """Send complete forecast with alerts - only called on scheduled updates"""
+    if now is None:
+        now = datetime.now(DEFAULT_TIMEZONE)
+
+    last_update = state.get_last_forecast_update()
+    if last_update and (now - last_update).total_seconds() < 300:
+        print("Skipping duplicate forecast update.")
+        return
+
+    try:
+        state.set_last_forecast_update(now)
+
+        # Get forecast times
+        forecast_times = get_forecast_times(now)
+
+        # Fetch weather data
+        if settings.get("API_TYPE") == "OpenWeather":
+            api = OpenWeatherAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
+        else:
+            api = TomorrowAPI(settings.get("API_KEY"), settings.get("ZIP_CODE"))
+
+        data = api.get_forecast_data()
+
+        if settings.get("FULL_API_LOGGING"):
+            Logger.log(f"{api.__class__.__name__} response: {json.dumps(data)}", settings)
+
+        today_blocks, future_blocks = api.parse_forecast(data, forecast_times, settings)
+
+        # Build display text
+        colored_text = build_colored_blocks(today_blocks, "today") + build_colored_blocks(future_blocks, "future")
+        next_update = get_next_forecast_update(now)
+        next_update_str = next_update.strftime("%m/%d/%y %I:%M %p").lstrip('0').replace(' 0', ' ')
+        update_text = f" || Next Update: {next_update_str}"
+
+        # Store the forecast message
+        forecast_message = colored_text + update_text
+        state.set_last_forecast_message(forecast_message)
+
+        # Add NHC hurricanes
+        nhc_names = state.get_nhc_names()
+        nhc_text = f" || {FS}{ALERT_COLOR}NHC Atlantic Hurricane(s): {', '.join(nhc_names)}" if nhc_names else ""
+
+        # Add NWS alerts at the END
+        nws_headlines = state.get_nws_headlines()
+        nws_text = "".join([f" || {FS}{ALERT_COLOR}NWS Alert: {headline}" for headline in nws_headlines])
+
+        # Build complete message
+        full_message = forecast_message + nhc_text + nws_text
+
+        # Truncate if needed
+        if len(full_message) > MAX_DISPLAY_MESSAGE_SIZE:
+            truncated_future = build_colored_blocks(future_blocks[:3], "future")
+            full_message = build_colored_blocks(today_blocks,
+                                                "today") + truncated_future + update_text + nhc_text + nws_text
             if len(full_message) > MAX_DISPLAY_MESSAGE_SIZE:
                 full_message = full_message[:MAX_DISPLAY_MESSAGE_SIZE - 3] + "..."
 
         # Send to display
         betabrite.send_message(full_message, settings=settings)
-        Logger.log("Forecast sent" if not update_alerts_only else "Alerts updated", settings)
-        print(f"Forecast updated at {now.strftime('%I:%M %p')}" if not update_alerts_only else "Alerts appended to display")
+        Logger.log("Forecast sent", settings)
+        print(f"Forecast updated at {now.strftime('%I:%M %p')}")
 
     except Exception as e:
-        if not update_alerts_only:
-            state.set_last_forecast_update(None)
+        state.set_last_forecast_update(None)
         Logger.log(f"Forecast error: {e}", settings)
         print(f"Error sending forecast: {e}")
         traceback.print_exc()
@@ -988,7 +1004,7 @@ def do_fresh_poll(betabrite: BetaBrite, settings: Dict, reason: str = ""):
 
     # Poll NHC
     print("Checking NHC storms...")
-    NHCMonitor.check_storms(settings)
+    NHCMonitor.check_storms(settings, betabrite)
 
     # Send forecast
     print("Fetching forecast...")
@@ -1098,8 +1114,8 @@ def main():
 
                     # Update forecast if alert status changed
                     if was_alert_active != is_alert_active:
-                        print(f"Alert status changed - updating forecast")
-                        send_forecast(betabrite, settings, now)
+                        print(f"Alert status changed - appending alerts")
+                        append_alerts_to_display(betabrite, settings)
 
                     # Calculate next check
                     if is_alert_active:
@@ -1116,9 +1132,7 @@ def main():
                 # === NHC CHECKS (5, 11, 17, 23) ===
                 last_nhc = state.get_nhc_pull_time()
                 if should_check_nhc(now, last_nhc):
-                    NHCMonitor.check_storms(settings)
-                    # Update forecast to show hurricanes
-                    send_forecast(betabrite, settings, now)
+                    NHCMonitor.check_storms(settings, betabrite)
 
             # === SERIAL RECONNECT ===
             if not betabrite.is_connected():
