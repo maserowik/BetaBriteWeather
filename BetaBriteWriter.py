@@ -681,7 +681,7 @@ class NHCMonitor:
 
             hurricanes = [
                 s for s in data.get("activeStorms", [])
-                if s.get("classification", "") == "HU" and s.get("basin", "").upper() == "AL"
+                if s.get("classification", "") == "HU" and s.get("id", "").lower().startswith("al")
             ]
 
             if hurricanes:
