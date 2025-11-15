@@ -882,7 +882,30 @@ def review_settings(settings: Dict) -> Dict:
             print("\n" + json.dumps(settings, indent=4))
         elif choice == "2":
             current = settings.get("COM_PORT", "")
-            settings["COM_PORT"] = input(f"Enter COM port [current: {current or 'none'}]: ").strip() or current
+
+            # List available serial ports
+            available_ports = list(list_ports.comports())
+            if available_ports:
+                print("\nAvailable serial ports:")
+                for idx, port in enumerate(available_ports, 1):
+                    print(f"  {idx}. {port.device} - {port.description}")
+                print(f"  M. Manual entry")
+                print()
+
+                port_choice = input(f"Select port number, M for manual, or press Enter to keep current [{current or 'none'}]: ").strip().upper()
+
+                if port_choice == "M":
+                    settings["COM_PORT"] = input(f"Enter COM port manually: ").strip() or current
+                elif port_choice.isdigit() and 1 <= int(port_choice) <= len(available_ports):
+                    settings["COM_PORT"] = available_ports[int(port_choice) - 1].device
+                    print(f"Selected: {settings['COM_PORT']}")
+                elif port_choice == "":
+                    pass  # Keep current
+                else:
+                    print("Invalid selection, keeping current port")
+            else:
+                print("\nNo serial ports detected.")
+                settings["COM_PORT"] = input(f"Enter COM port manually [current: {current or 'none'}]: ").strip() or current
         elif choice == "3":
             current = settings.get("ZIP_CODE", "")
             key = settings.get("API_KEY", "")

@@ -11,4 +11,3 @@ build/
 *.json
 .vs/
 .venv/
-BetaBriteWriter_Test.py
