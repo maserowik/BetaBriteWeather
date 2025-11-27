@@ -1,0 +1,27 @@
+[Unit]
+Description=BetaBrite Weather Display
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=beta-blink
+WorkingDirectory=/home/beta-blink/BetaBriteWeather
+Environment=HOME=/home/beta-blink
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PYTHONUNBUFFERED=1
+
+# Start with wrapper script that handles configuration
+ExecStart=/home/beta-blink/BetaBriteWeather/betabrite_start.sh
+
+# On restart, wait 10 seconds
+Restart=on-failure
+RestartSec=10
+
+# Allow graceful shutdown
+TimeoutStopSec=30
+KillMode=mixed
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target
