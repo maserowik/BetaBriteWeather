@@ -650,7 +650,23 @@ class NWSAlerts:
 
             if alerts:
                 latest = alerts[0]["id"]
-                headlines = [a["properties"]["headline"] for a in alerts if "headline" in a["properties"]]
+
+                # Extract descriptions and truncate at first \n\n
+                headlines = []
+                for a in alerts:
+                    props = a.get("properties", {})
+                    desc = props.get("description", "")
+
+                    # Stop at first occurrence of \n\n
+                    if "\n\n" in desc:
+                        desc = desc.split("\n\n")[0]
+
+                    # Clean up any remaining newlines and extra whitespace
+                    desc = desc.replace("\n", " ").strip()
+
+                    if desc:
+                        headlines.append(desc)
+
                 state.set_nws_headlines(headlines)
                 if latest != state.get_alert_id():
                     state.set_alert_id(latest)
