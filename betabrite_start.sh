@@ -1,45 +1,48 @@
 #!/bin/bash
-
-# BetaBrite startup wrapper script
-# Gives user option to configure settings before starting
+# betabrite_start.sh
+# BetaBrite Weather Display — startup wrapper
+#
+# Interactive mode:  prompts user to configure or start
+# Service mode:      starts headless directly (no terminal attached)
 
 SCRIPT_DIR="/home/beta-blink/BetaBriteWeather"
 PYTHON_BIN="$SCRIPT_DIR/.beta/bin/python"
-MAIN_SCRIPT="$SCRIPT_DIR/BetaBriteWriter.py"
+WRITER="$SCRIPT_DIR/BetaBriteWriter.py"
+CONFIGURE="$SCRIPT_DIR/BetaBriteConfigure.py"
 JSON_FILE="$SCRIPT_DIR/BetaBriteWriter.json"
 
-cd "$SCRIPT_DIR" || exit 1
+cd "$SCRIPT_DIR" || { echo "ERROR: Cannot cd to $SCRIPT_DIR"; exit 1; }
 
-# Check if this is a manual start (interactive terminal)
+# ── INTERACTIVE MODE (manual terminal start) ──────────────────────────────────
 if [ -t 0 ]; then
-    # Interactive mode - show menu
     echo "========================================"
     echo "  BetaBrite Weather Display Startup"
     echo "========================================"
     echo ""
-    echo "Current configuration:"
+
     if [ -f "$JSON_FILE" ]; then
+        echo "Current configuration:"
         cat "$JSON_FILE"
     else
-        echo "  No configuration file found"
+        echo "  No configuration file found."
     fi
+
     echo ""
     echo "Options:"
     echo "  1. Start with current settings"
-    echo "  2. Configure settings (interactive menu)"
+    echo "  2. Configure settings"
     echo "  3. Exit"
     echo ""
-    read -p "Enter choice [1]: " choice
-    choice=${choice:-1}
+    read -rp "Enter choice [1]: " choice
+    choice="${choice:-1}"
 
-    case $choice in
+    case "$choice" in
         2)
-            echo "Starting configuration menu..."
-            "$PYTHON_BIN" "$MAIN_SCRIPT"
-            exit 0
+            echo "Launching configuration tool..."
+            exec "$PYTHON_BIN" "$CONFIGURE"
             ;;
         3)
-            echo "Exiting..."
+            echo "Exiting."
             exit 0
             ;;
         *)
@@ -48,39 +51,18 @@ if [ -t 0 ]; then
     esac
 fi
 
-# Start in headless mode using settings from JSON
+# ── SERVICE / HEADLESS MODE ───────────────────────────────────────────────────
 if [ ! -f "$JSON_FILE" ]; then
     echo "ERROR: Configuration file not found: $JSON_FILE"
-    echo "Please run configuration first:"
-    echo "  $PYTHON_BIN $MAIN_SCRIPT"
+    echo "Run the configuration tool first:"
+    echo "  $PYTHON_BIN $CONFIGURE"
     exit 1
 fi
 
-# Extract settings from JSON
-COM_PORT=$(jq -r '.COM_PORT' "$JSON_FILE")
-API_KEY=$(jq -r '.API_KEY' "$JSON_FILE")
-ZIP_CODE=$(jq -r '.ZIP_CODE' "$JSON_FILE")
-FORECAST_ZONE=$(jq -r '.FORECAST_ZONE' "$JSON_FILE")
-API_TYPE=$(jq -r '.API_TYPE // "OpenWeather"' "$JSON_FILE")
-LOGGING_ON=$(jq -r '.LOGGING_ON // false' "$JSON_FILE")
-
-# Build command
-CMD="$PYTHON_BIN $MAIN_SCRIPT --headless"
-CMD="$CMD --com \"$COM_PORT\""
-CMD="$CMD --api-key \"$API_KEY\""
-CMD="$CMD --zip \"$ZIP_CODE\""
-CMD="$CMD --zone \"$FORECAST_ZONE\""
-CMD="$CMD --api-type \"$API_TYPE\""
-
-if [ "$LOGGING_ON" = "true" ]; then
-    CMD="$CMD --logging"
-fi
-
-echo "Starting BetaBrite Weather Display..."
-echo "Configuration: $JSON_FILE"
-echo "COM Port: $COM_PORT"
-echo "ZIP Code: $ZIP_CODE"
+echo "Starting BetaBrite Weather Display (headless)..."
+echo "Config: $JSON_FILE"
 echo ""
 
-# Execute
-eval exec $CMD
+# --headless tells the writer to read settings from JSON.
+# --skip-validation avoids live API calls on every service restart.
+exec "$PYTHON_BIN" "$WRITER" --headless --skip-validation
